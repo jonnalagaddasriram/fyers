@@ -1,0 +1,15 @@
+{
+    "trade_direction": "CE",
+    "expiry_week": 0,
+    "ce_offset_points": 150,
+    "pe_offset_points": 150,
+    "lot_size": 25,
+    "num_lots": 1,
+    "product_type": "INTRADAY",
+    "order_type": "MARKET",
+    "strike_change_confirm_seconds": 120,
+    "max_position_value": 500000,
+    "max_daily_loss": 10000,
+    "trading_start_time": "09:20",
+    "trading_end_time": "15:15"
+}
