@@ -1,0 +1,5 @@
+2026/03/13 16:14:04 Connecting to wss://rtsocket-api.fyers.in/versova
+2026/03/13 16:14:05 Connected! Status Code: 101
+2026/03/13 16:14:05 Sending subMsg: map[data:map[channel:1 mode:depth subs:1 symbols:[NSE:NIFTY50-INDEX NSE:NIFTY2530623250CE]] type:1]
+2026/03/13 16:14:05 Sending resumeMsg: map[data:map[pauseChannels:[] resumeChannels:[1]] type:2]
+2026/03/13 16:14:15 Read err: read tcp [2601:646:9e81:3b50:4071:71a8:b4cc:3bf6]:50805->[2606:4700::6812:587]:443: i/o timeout
