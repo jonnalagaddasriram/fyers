@@ -20,6 +20,15 @@ To run the main application (ensure `FYERS_APP_ID`, `FYERS_APP_SECRET`, and `FYE
 go run .
 ```
 
+## Running Analytics
+
+After running the application and capturing data in `ticks.txt`, you can analyze the latency and tick intervals by running the analytics module.
+
+```bash
+# Run the analytics report
+go run ./analytics
+```
+
 ## Dependency Management
 
 To ensure all required Go modules are downloaded and the `go.mod` file is tidy:

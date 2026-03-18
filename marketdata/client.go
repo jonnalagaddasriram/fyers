@@ -1,9 +1,12 @@
 package marketdata
 
 import (
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
+	fyersgosdk "github.com/FyersDev/fyers-go-sdk"
 	fyersws "github.com/FyersDev/fyers-go-sdk/websocket"
 )
 
@@ -63,9 +66,36 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 		if exchTimeVal, ok := message["exch_feed_time"]; ok {
 			tick.ExchTimestamp = convertToInt64(exchTimeVal)
 		}
-		// Try bid/ask which might be in "bids" / "asks" mapped arrays,
-		// but for Nifty options getting LTP is prioritized on the hotpath.
-		// Detailed fields can be added here.
+		if bidPrice, ok := message["bid_price"]; ok {
+			tick.BidPrice = convertToFloat64(bidPrice)
+		}
+		if askPrice, ok := message["ask_price"]; ok {
+			tick.AskPrice = convertToFloat64(askPrice)
+		}
+		if bidSize, ok := message["bid_size"]; ok {
+			tick.BidSize = convertToInt64(bidSize)
+		}
+		if askSize, ok := message["ask_size"]; ok {
+			tick.AskSize = convertToInt64(askSize)
+		}
+		if openVal, ok := message["open_price"]; ok {
+			tick.Open = convertToFloat64(openVal)
+		}
+		if highVal, ok := message["high_price"]; ok {
+			tick.High = convertToFloat64(highVal)
+		}
+		if lowVal, ok := message["low_price"]; ok {
+			tick.Low = convertToFloat64(lowVal)
+		}
+		if closeVal, ok := message["prev_close_price"]; ok {
+			tick.Close = convertToFloat64(closeVal)
+		}
+		if chVal, ok := message["ch"]; ok {
+			tick.Change = convertToFloat64(chVal)
+		}
+		if chpVal, ok := message["chp"]; ok {
+			tick.ChangePercent = convertToFloat64(chpVal)
+		}
 
 		// Write to ring buffer
 		client.ringBuffer.Write(tick)
@@ -99,10 +129,18 @@ func (c *FyersWSClient) Close() {
 }
 
 func (c *FyersWSClient) Subscribe(symbols []string) {
-	c.symbols = symbols
-	if c.socket != nil { // will actually send if connected
+	c.symbols = append(c.symbols, symbols...)
+	if c.socket != nil {
 		c.socket.Subscribe(symbols, "SymbolUpdate")
 		c.logger.Info("Subscribed to symbols", "symbols", symbols)
+	}
+}
+
+func (c *FyersWSClient) Unsubscribe(symbols []string) {
+	// Not perfect symbol tracking here, but Fyers SDK tracks it internally anyway for Unsubscribe
+	if c.socket != nil {
+		c.socket.Unsubscribe(symbols, "SymbolUpdate")
+		c.logger.Info("Unsubscribed from symbols", "symbols", symbols)
 	}
 }
 
@@ -140,4 +178,26 @@ func convertToInt64(val interface{}) int64 {
 	default:
 		return 0
 	}
+}
+
+// VerifyToken calls the Fyers Profile API to ensure the access token is valid
+// before attempting to open the WebSocket connection.
+func VerifyToken(appID, accessToken string) error {
+	client := fyersgosdk.NewFyersModel(appID, accessToken)
+
+	profStr, err := client.GetProfile()
+	if err != nil {
+		return fmt.Errorf("API request failed: %w", err)
+	}
+
+	var profile fyersgosdk.Profile
+	if err := json.Unmarshal([]byte(profStr), &profile); err != nil {
+		return fmt.Errorf("failed to parse profile response: %w", err)
+	}
+
+	if profile.S != "ok" {
+		return fmt.Errorf("invalid token (code: %d, message: %s)", profile.Code, profile.Message)
+	}
+
+	return nil
 }

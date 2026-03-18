@@ -11,6 +11,7 @@ import (
 
 	"fyers-trading/config"
 	"fyers-trading/marketdata"
+	"fyers-trading/symbols"
 )
 
 func setLogger(level string, format string) *slog.Logger {
@@ -54,6 +55,38 @@ func main() {
 	// Format specific to Fyers WS: "app_id:access_token"
 	wsToken := fmt.Sprintf("%s:%s", appCfg.FyersAppID, appCfg.FyersAccessToken)
 
+	// Verify Access Token via Profile API
+	logger.Info("Verifying Fyers access token via Profile API...")
+	if err := marketdata.VerifyToken(appCfg.FyersAppID, appCfg.FyersAccessToken); err != nil {
+		logger.Error("Access token verification failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Access token verified successfully.")
+
+	// 1.5 Load Trading Config and start Hot-Reloader
+	tradingCfg, err := config.LoadTradingConfig("trading.json")
+	if err != nil {
+		logger.Error("Failed to load trading.json", "error", err)
+		os.Exit(1)
+	}
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := tradingCfg.Reload("trading.json"); err != nil {
+				logger.Warn("Failed to hot-reload trading.json", "error", err)
+			}
+		}
+	}()
+
+	// 1.6 Initialize IMF Manager (Master File)
+	imfManager := symbols.NewIMFManager(logger, "data")
+	if err := imfManager.Initialize(); err != nil {
+		logger.Error("Failed to initialize Fyers Instrument Master File", "error", err)
+		os.Exit(1)
+	}
+
 	// 2. Initialize Market Data Infrastructure
 	ringBuffer := marketdata.NewRingBuffer(appCfg.RingBufferSize)
 
@@ -67,11 +100,40 @@ func main() {
 
 	// completely eliminate Terminal I/O lag from the hot path.
 	testReader := ringBuffer.NewReader()
+	pipelineReader := ringBuffer.NewReader()
 
-	// Pre-allocate a large slice so `append` never blocks for reallocation.
 	ticksLog := make([]marketdata.TickEvent, 0, 500000)
 	doneChan := make(chan bool)
 
+	// We declare wsClient here so we can inject it into the Pipeline
+	wsClient := marketdata.NewFyersWSClient(wsToken, ringBuffer, logger)
+	pipeline := symbols.NewPipeline(logger, wsClient, tradingCfg, imfManager)
+
+	// Thread 2: The Pipeline (Takes one read cursor, computes symbol rules dynamically)
+	go func() {
+		initialSetupDone := false
+		for {
+			tick := pipelineReader.Next()
+			if tick == nil {
+				return
+			}
+			
+			// Process Nifty Ticks through the Pipeline
+			if tick.Symbol == "NSE:NIFTY50-INDEX" {
+				if !initialSetupDone && tick.LTP > 0 {
+					if err := pipeline.SetInitialState(tick.LTP); err != nil {
+						logger.Error("Failed to initialize pipeline state", "error", err)
+					} else {
+						initialSetupDone = true
+					}
+				} else if initialSetupDone {
+					pipeline.ProcessNiftyTick(tick.LTP)
+				}
+			}
+		}
+	}()
+
+	// Thread 3: The Logger / Final Memory array (Takes a second read cursor)
 	go func() {
 		for {
 			tick := testReader.Next()
@@ -79,24 +141,21 @@ func main() {
 				close(doneChan)
 				return
 			}
+			
 			// Store a struct copy so we don't accidentally maintain pointers to pooled objects
 			ticksLog = append(ticksLog, *tick)
 		}
 	}()
 
-	// 3. Start WS Client
-	wsClient := marketdata.NewFyersWSClient(wsToken, ringBuffer, logger)
+	// 3. Start WS Client connecting
 	if err := wsClient.Connect(); err != nil {
 		logger.Error("Failed to connect to Fyers WebSocket", "error", err)
 		os.Exit(1)
 	}
 
-	// For testing: Subscribe to Nifty50 Index and ATM Strikes (23242 -> 23250)
-	// Example expiry: March 17 2026 => 26317
+	// Subscribe only to the index initially. The Pipeline takes over the options!
 	wsClient.Subscribe([]string{
 		"NSE:NIFTY50-INDEX",
-		"NSE:NIFTY2631723250CE",
-		"NSE:NIFTY2631723250PE",
 	})
 
 	// Wait for termination

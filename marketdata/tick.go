@@ -13,6 +13,8 @@ type TickEvent struct {
 	Volume        int64
 	BidPrice      float64
 	AskPrice      float64
+	BidSize       int64
+	AskSize       int64
 	Change        float64
 	ChangePercent float64
 	ExchTimestamp int64 // timestamp from exchange (seconds)

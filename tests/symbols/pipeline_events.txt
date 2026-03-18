@@ -1,0 +1,32 @@
+{"timestamp":"14:54:45","event":"INIT","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"Nifty LTP=23455.00"}
+{"timestamp":"14:54:46","event":"INIT","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"Nifty LTP=23455.00"}
+{"timestamp":"14:54:46","event":"TIMER_START","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:54:47","event":"TIMER_EXTEND","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"added=1s"}
+{"timestamp":"14:54:48","event":"ACTIVE_SWITCH","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"confirmed after timer"}
+{"timestamp":"14:54:49","event":"INIT","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"Nifty LTP=23455.00"}
+{"timestamp":"14:54:50","event":"TIMER_START","atm":23550,"symbols":["NSE:NIFTY2631723400CE","NSE:NIFTY2631723700PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:54:51","event":"ACTIVE_SWITCH","atm":23550,"symbols":["NSE:NIFTY2631723400CE","NSE:NIFTY2631723700PE"],"note":"confirmed after timer"}
+{"timestamp":"14:54:51","event":"INIT","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"Nifty LTP=23455.00"}
+{"timestamp":"14:54:52","event":"TIMER_START","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:54:52","event":"TIMER_EXTEND","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"added=1s"}
+{"timestamp":"14:54:53","event":"TIMER_EXTEND","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"added=1s"}
+{"timestamp":"14:54:54","event":"TIMER_EXTEND","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"added=1s"}
+{"timestamp":"14:54:54","event":"TIMER_EXTEND","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"added=1s"}
+{"timestamp":"14:54:54","event":"ACTIVE_SWITCH","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirmed after timer"}
+{"timestamp":"14:54:55","event":"TIMER_START","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:54:56","event":"TIMER_EXTEND","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"added=1s"}
+{"timestamp":"14:54:56","event":"TIMER_EXTEND","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"added=1s"}
+{"timestamp":"14:54:57","event":"TIMER_EXTEND","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"added=1s"}
+{"timestamp":"14:54:58","event":"TIMER_EXTEND","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"added=1s"}
+{"timestamp":"14:54:58","event":"ACTIVE_SWITCH","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"confirmed after timer"}
+{"timestamp":"14:54:59","event":"TIMER_START","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:54:59","event":"TIMER_EXTEND","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"added=1s"}
+{"timestamp":"14:55:00","event":"TIMER_EXTEND","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"added=1s"}
+{"timestamp":"14:55:00","event":"INIT","atm":23450,"symbols":["NSE:NIFTY2631723300CE","NSE:NIFTY2631723600PE"],"note":"Nifty LTP=23455.00"}
+{"timestamp":"14:55:01","event":"TIMER_START","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:55:01","event":"ACTIVE_SWITCH","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirmed after timer"}
+{"timestamp":"14:55:02","event":"TIMER_EXTEND","atm":23550,"symbols":["NSE:NIFTY2631723400CE","NSE:NIFTY2631723700PE"],"note":"added=1s"}
+{"timestamp":"14:55:02","event":"ACTIVE_SWITCH","atm":23500,"symbols":["NSE:NIFTY2631723350CE","NSE:NIFTY2631723650PE"],"note":"confirmed after timer"}
+{"timestamp":"14:55:02","event":"POST_CYCLE_MISMATCH","atm":23550,"note":"confirmed=23500 live=23550 starting new cycle"}
+{"timestamp":"14:55:02","event":"TIMER_START","atm":23550,"symbols":["NSE:NIFTY2631723400CE","NSE:NIFTY2631723700PE"],"note":"confirm=1s max=3s"}
+{"timestamp":"14:55:02","event":"ACTIVE_SWITCH","atm":23550,"symbols":["NSE:NIFTY2631723400CE","NSE:NIFTY2631723700PE"],"note":"confirmed after timer"}

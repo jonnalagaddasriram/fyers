@@ -38,6 +38,8 @@ type TradingConfig struct {
 	ProductType                string `json:"product_type"`
 	OrderType                  string `json:"order_type"`
 	StrikeChangeConfirmSeconds int    `json:"strike_change_confirm_seconds"`
+	StrikeChangeExtraSeconds   int    `json:"strike_change_extra_seconds"`
+	MaxConfirmSeconds          int    `json:"max_confirm_seconds"`
 	MaxPositionValue           int    `json:"max_position_value"`
 	MaxDailyLoss               int    `json:"max_daily_loss"`
 	TradingStartTime           string `json:"trading_start_time"`
@@ -125,6 +127,7 @@ func (tc *TradingConfig) Reload(filePath string) error {
 	tc.ProductType = newCfg.ProductType
 	tc.OrderType = newCfg.OrderType
 	tc.StrikeChangeConfirmSeconds = newCfg.StrikeChangeConfirmSeconds
+	tc.StrikeChangeExtraSeconds = newCfg.StrikeChangeExtraSeconds
 	tc.MaxPositionValue = newCfg.MaxPositionValue
 	tc.MaxDailyLoss = newCfg.MaxDailyLoss
 	tc.TradingStartTime = newCfg.TradingStartTime
@@ -187,6 +190,21 @@ func (tc *TradingConfig) GetStrikeChangeConfirmSeconds() int {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
 	return tc.StrikeChangeConfirmSeconds
+}
+
+func (tc *TradingConfig) GetStrikeChangeExtraSeconds() int {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return tc.StrikeChangeExtraSeconds
+}
+
+func (tc *TradingConfig) GetMaxConfirmSeconds() int {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	if tc.MaxConfirmSeconds <= 0 {
+		return 360 // safe default: 6 minutes absolute max
+	}
+	return tc.MaxConfirmSeconds
 }
 
 func (tc *TradingConfig) GetMaxPositionValue() int {
