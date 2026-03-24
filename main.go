@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"fyers-trading/infra"
 	"fyers-trading/marketdata"
 	"fyers-trading/symbols"
+
+	fyersws "github.com/FyersDev/fyers-go-sdk/websocket"
 )
 
 func setLogger(level string, format string) *slog.Logger {
@@ -100,25 +103,31 @@ func main() {
 	}
 
 	// 2. Initialize Market Data Infrastructure
-	ringBuffer := marketdata.NewRingBuffer(appCfg.RingBufferSize)
+	// We use two completely independent lock-free pure SPMC RingBuffers!
+	optionsRingBuffer := marketdata.NewRingBuffer(appCfg.RingBufferSize)
+	indexRingBuffer := marketdata.NewRingBuffer(1024)
 
 	// Track latest prices
 	tickStore := marketdata.NewTickStore(logger)
-	tickStore.StartReader(ringBuffer.NewReader())
+	tickStore.StartReader(optionsRingBuffer.NewReader())
+	tickStore.StartReader(indexRingBuffer.NewReader())
 
 	// Watch internal latencies (printing every 5 seconds)
 	latencyMonitor := marketdata.NewLatencyMonitor(logger, 5*time.Second)
-	latencyMonitor.StartReader(ringBuffer.NewReader())
+	latencyMonitor.StartReader(optionsRingBuffer.NewReader())
+	latencyMonitor.StartReader(indexRingBuffer.NewReader())
 
 	// completely eliminate Terminal I/O lag from the hot path.
-	testReader := ringBuffer.NewReader()
-	pipelineReader := ringBuffer.NewReader()
+	testOptionReader := optionsRingBuffer.NewReader()
+	testIndexReader := indexRingBuffer.NewReader()
+	pipelineReader := indexRingBuffer.NewReader() // Pipeline strictly reads Index to calculate ATM strikes
 
+	var ticksLogMu sync.Mutex
 	ticksLog := make([]marketdata.TickEvent, 0, 500000)
 	doneChan := make(chan bool)
 
 	// We declare wsClient here so we can inject it into the Pipeline
-	wsClient := marketdata.NewFyersWSClient(wsToken, ringBuffer, logger)
+	wsClient := marketdata.NewFyersWSClient(wsToken, optionsRingBuffer, logger)
 	pipeline := symbols.NewPipeline(logger, wsClient, tradingCfg, imfManager, store)
 
 	// Thread 2: The Pipeline (Takes one read cursor, computes symbol rules dynamically)
@@ -145,32 +154,139 @@ func main() {
 		}
 	}()
 
-	// Thread 3: The Logger / Final Memory array (Takes a second read cursor)
+	// Thread 3a: Options Logger
 	go func() {
 		for {
-			tick := testReader.Next()
+			tick := testOptionReader.Next()
 			if tick == nil {
 				close(doneChan)
 				return
 			}
 			
-			// Store a struct copy so we don't accidentally maintain pointers to pooled objects
+			// Thread-safe append to unified file log
+			ticksLogMu.Lock()
 			ticksLog = append(ticksLog, *tick)
+			ticksLogMu.Unlock()
+		}
+	}()
+
+	// Thread 3b: Index Logger
+	go func() {
+		for {
+			tick := testIndexReader.Next()
+			if tick == nil {
+				return
+			}
+			
+			ticksLogMu.Lock()
+			ticksLog = append(ticksLog, *tick)
+			ticksLogMu.Unlock()
 		}
 	}()
 
 
 
-	// 3. Start WS Client connecting
+	// 3. Start the Hybrid WebSocket Connections
+	// 3a. Custom TBT Protobuf Socket (For High-Frequency Options Depth)
 	if err := wsClient.Connect(); err != nil {
-		logger.Error("Failed to connect to Fyers WebSocket", "error", err)
+		logger.Error("Failed to connect to Fyers TBT WebSocket", "error", err)
 		os.Exit(1)
 	}
 
-	// Subscribe only to the index initially. The Pipeline takes over the options!
-	wsClient.Subscribe([]string{
-		"NSE:NIFTY50-INDEX",
-	})
+	// 3b. Official Fyers SDK Socket (For the Nifty Index ONLY, as it lacks depth)
+	indexSymbols := []string{"NSE:NIFTY50-INDEX"}
+	
+	onIndexConnect := func() {
+		logger.Info("Index SDK Socket Connected. Subscribing to Nifty50 Index.")
+		// We use an external variable scope so we can access indexSocket here, but we can't easily do it exactly 
+		// inside the func literal unless indexSocket is declared beforehand.
+	}
+
+	onIndexMessage := func(message fyersws.DataResponse) {
+		tick := marketdata.GetTickEvent()
+		tick.RecvTimestamp = time.Now().UnixNano()
+
+		if sym, ok := message["symbol"].(string); ok {
+			tick.Symbol = sym
+		} else {
+			marketdata.PutTickEvent(tick)
+			return
+		}
+
+		if ltpVal, ok := message["ltp"]; ok {
+			switch v := ltpVal.(type) {
+			case float64:
+				tick.LTP = v
+			case int:
+				tick.LTP = float64(v)
+			case int32:
+				tick.LTP = float64(v)
+			case int64:
+				tick.LTP = float64(v)
+			case fyersws.FloatSDK:
+				tick.LTP = float64(v)
+			}
+		}
+
+		if exchTimeVal, ok := message["exch_feed_time"]; ok {
+			switch v := exchTimeVal.(type) {
+			case int64:
+				tick.ExchTimestamp = v
+			case int32:
+				tick.ExchTimestamp = int64(v)
+			case int:
+				tick.ExchTimestamp = int64(v)
+			case float64:
+				tick.ExchTimestamp = int64(v)
+			case fyersws.FloatSDK:
+				tick.ExchTimestamp = int64(v)
+			}
+		}
+		
+		if tick.LTP > 0 {
+			indexRingBuffer.Write(tick)
+		} else {
+			marketdata.PutTickEvent(tick)
+		}
+	}
+
+	onError := func(message fyersws.DataError) {
+		logger.Error("Index SDK Socket Error", "error", message)
+	}
+
+	onClose := func(message fyersws.DataClose) {
+		logger.Warn("Index SDK Socket Closed", "msg", message)
+	}
+
+	indexSocket := fyersws.NewFyersDataSocket(
+		wsToken,
+		"",    // log path
+		false, // lite mode
+		false, // Write to file
+		true,  // auto reconnect
+		1,     // 1ms queue processing interval (ultra-low latency)
+		onIndexConnect,
+		onClose,
+		onError,
+		onIndexMessage,
+	)
+
+	// Since we couldn't properly inject indexSocket into the onIndexConnect literal (because 
+	// it's a value-copy closure at config-time in the SDK), we simply subscribe post-connection.
+	go func() {
+		logger.Info("Attempting SDK Index WebSocket connection...")
+		if err := indexSocket.Connect(); err != nil {
+			logger.Error("Failed to connect to Index SDK Socket", "error", err)
+		}
+	}()
+
+	// Give it a tiny delay to connect before manually calling Subscribe, 
+	// since the SDK Connect() call blocks in its own loop in the background!
+	go func() {
+		time.Sleep(2 * time.Second)
+		indexSocket.Subscribe(indexSymbols, "SymbolUpdate")
+		logger.Info("Subscribed Index to SymbolUpdate via SDK", "symbols", indexSymbols)
+	}()
 
 	// Wait for termination (OS signal or Market Close)
 	sigChan := make(chan os.Signal, 1)
@@ -182,8 +298,10 @@ func main() {
 	// Cancel context — signals the Replicator to flush one final snapshot
 	cancelCtx()
 	wsClient.Close()
+	indexSocket.CloseConnection()
 	// Close ring buffer to signal all reader goroutines to exit gracefully
-	ringBuffer.Close()
+	optionsRingBuffer.Close()
+	indexRingBuffer.Close()
 
 	<-doneChan
 

@@ -62,10 +62,17 @@ func main() {
 	var maxInterArrivalTime time.Duration = -1
 	var interArrivalCount int64
 
-	var exchStartTime time.Time
-	var exchEndTime time.Time
 	var localStartTime time.Time
 	var localEndTime time.Time
+
+	// Batch analytics tracking per symbol
+	type BatchStats struct {
+		BatchSizes       []int
+		TimeGaps         []time.Duration
+		CurrentBatchSize int
+		LastBatchTime    time.Time
+	}
+	batchInfo := make(map[string]*BatchStats)
 
 	type ATMSwitch struct {
 		Time   time.Time
@@ -126,19 +133,33 @@ func main() {
 			b.TotalRecords++
 			b.SymbolCounts[tick.Symbol]++
 
-			// Update total time windows
-			if exchStartTime.IsZero() || exchTime.Before(exchStartTime) {
-				exchStartTime = exchTime
-			}
-			if exchTime.After(exchEndTime) {
-				exchEndTime = exchTime
-			}
-			
 			if localStartTime.IsZero() || recvTime.Before(localStartTime) {
 				localStartTime = recvTime
 			}
 			if recvTime.After(localEndTime) {
 				localEndTime = recvTime
+			}
+
+			// Batch tracking
+			if _, ok := batchInfo[tick.Symbol]; !ok {
+				batchInfo[tick.Symbol] = &BatchStats{}
+			}
+			bStats := batchInfo[tick.Symbol]
+
+			if bStats.LastBatchTime.IsZero() {
+				bStats.LastBatchTime = recvTime
+				bStats.CurrentBatchSize = 1
+			} else {
+				// Ticks arriving within 10ms of each other belong to the same network batch
+				gap := recvTime.Sub(bStats.LastBatchTime)
+				if gap < 10*time.Millisecond {
+					bStats.CurrentBatchSize++
+				} else {
+					bStats.BatchSizes = append(bStats.BatchSizes, bStats.CurrentBatchSize)
+					bStats.TimeGaps = append(bStats.TimeGaps, gap)
+					bStats.CurrentBatchSize = 1
+					bStats.LastBatchTime = recvTime
+				}
 			}
 
 			// Calculate Inter-arrival time
@@ -173,6 +194,13 @@ func main() {
 		}
 	}
 
+	// Flush final batches
+	for _, bStats := range batchInfo {
+		if bStats.CurrentBatchSize > 0 {
+			bStats.BatchSizes = append(bStats.BatchSizes, bStats.CurrentBatchSize)
+		}
+	}
+
 	if err := scanner.Err(); err != nil {
 		fmt.Printf("Error reading file: %v\n", err)
 	}
@@ -187,8 +215,9 @@ func main() {
 	fmt.Println("==================================================")
 	fmt.Printf("Total Records Processed : %d\n", totalRecords)
 	
-	if !exchStartTime.IsZero() {
-		fmt.Printf("Exchange Time Window    : %s to %s (IST)\n", exchStartTime.In(istLoc).Format("15:04:05"), exchEndTime.In(istLoc).Format("15:04:05"))
+	if !localStartTime.IsZero() {
+		fmt.Printf("Local Test Time Window  : %s to %s (IST)\n", localStartTime.In(istLoc).Format("15:04:05"), localEndTime.In(istLoc).Format("15:04:05"))
+		fmt.Printf("Total Test Duration     : %s\n", localEndTime.Sub(localStartTime).Round(time.Second))
 	}
 
 	if skippedRecords > 0 {
@@ -220,6 +249,42 @@ func main() {
 
 	for sym, count := range symbolCounts {
 		fmt.Printf("  %s : %d ticks (%.1f%%)\n", sym, count, float64(count)/baseCount*100)
+		
+		// Print batch stats if it's an option (has batch sizes)
+		bStats := batchInfo[sym]
+		if bStats != nil && len(bStats.BatchSizes) > 0 {
+			var totalBatchSize int
+			for _, bs := range bStats.BatchSizes {
+				totalBatchSize += bs
+			}
+			avgBatch := float64(totalBatchSize) / float64(len(bStats.BatchSizes))
+
+			var totalGap time.Duration
+			var minGap time.Duration = time.Hour
+			var maxGap time.Duration = -1
+			for _, g := range bStats.TimeGaps {
+				totalGap += g
+				if g < minGap {
+					minGap = g
+				}
+				if g > maxGap {
+					maxGap = g
+				}
+			}
+			
+			var avgGap time.Duration
+			if len(bStats.TimeGaps) > 0 {
+				avgGap = totalGap / time.Duration(len(bStats.TimeGaps))
+			} else {
+				minGap = 0
+				maxGap = 0
+			}
+
+			fmt.Printf("    => Batches: %d | Avg per batch: %.2f ticks\n", len(bStats.BatchSizes), avgBatch)
+			if len(bStats.TimeGaps) > 0 {
+				fmt.Printf("    => Wait Gaps: Avg=%v | Min=%v | Max=%v\n", avgGap.Round(time.Millisecond), minGap.Round(time.Millisecond), maxGap.Round(time.Millisecond))
+			}
+		}
 	}
 
 

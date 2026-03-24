@@ -1,8 +1,8 @@
 {
     "trade_direction": "CE",
     "expiry_week": 1,
-    "ce_offset_points": 150,
-    "pe_offset_points": 150,
+    "ce_offset_points": 0,
+    "pe_offset_points": 0,
     "lot_size": 75,
     "num_lots": 1,
     "product_type": "INTRADAY",
