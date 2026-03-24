@@ -6,24 +6,34 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"time"
 )
 
-// roundToATM rounds the price to the nearest 50, matching ComputeATMStrike in symbols/nifty.go
+// roundToATM rounds the price to the nearest 50
 func roundToATM(price float64) int {
 	return int(math.Round(price/50.0)) * 50
 }
 
-// TickEvent mirrors the structure found in the ticks.txt
 type TickEvent struct {
 	Symbol        string  `json:"Symbol"`
 	LTP           float64 `json:"LTP"`
-	ExchTimestamp int64   `json:"ExchTimestamp"` // in seconds
-	RecvTimestamp int64   `json:"RecvTimestamp"` // in nanoseconds
+	ExchTimestamp int64   `json:"ExchTimestamp"`
+	RecvTimestamp int64   `json:"RecvTimestamp"`
+}
+
+type BucketStats struct {
+	TotalRecords      int64
+	TotalLatency      time.Duration
+	SymbolCounts      map[string]int64
+	InterArrivalCount int64
+	TotalInterArrival time.Duration
 }
 
 func main() {
-	// Look for ticks.txt in the current directory (since we run it from the fyers root)
+	// The interval for chunking the analysis (e.g., 15 minutes)
+	chunkMinutes := 15.0 
+
 	filePath := "ticks.txt"
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -32,13 +42,13 @@ func main() {
 	}
 	defer file.Close()
 
-	// Load India Standard Time (IST)
 	istLoc, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil {
 		fmt.Printf("Warning: Could not load Asia/Kolkata timezone, using local time: %v\n", err)
 		istLoc = time.Local
 	}
 
+	// Global variables 
 	var totalRecords int64
 	var totalLatency time.Duration
 	var minLatency time.Duration = time.Hour
@@ -46,33 +56,28 @@ func main() {
 	var skippedRecords int64
 	var symbolCounts = make(map[string]int64)
 
-	// Inter-arrival tracking
 	var lastRecvTime = make(map[string]time.Time)
 	var totalInterArrivalTime time.Duration
 	var minInterArrivalTime time.Duration = time.Hour
 	var maxInterArrivalTime time.Duration = -1
 	var interArrivalCount int64
 
-	// Time window tracking
 	var exchStartTime time.Time
 	var exchEndTime time.Time
 	var localStartTime time.Time
 	var localEndTime time.Time
 
-	// ATM Switch tracking (from Nifty index ticks)
 	type ATMSwitch struct {
 		Time   time.Time
 		ATM    int
-		GapSec float64 // seconds since last switch
+		GapSec float64
 	}
 	var atmSwitches []ATMSwitch
 	var currentATM int
 	var lastSwitchTime time.Time
 
-	// Since exchange timestamp is in seconds and receive timestamp in nanoseconds,
-	// we will calculate latency down to the millisecond.
-	// Note: Because Fyers API provides Exchange timestamp only to the second resolution (e.g., 1773654310),
-	// this latency calculation is an approximation bound by 1-second precision on the Exchange side.
+	// Time Buckets
+	buckets := make(map[int64]*BucketStats)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -84,7 +89,6 @@ func main() {
 		var tick TickEvent
 		err := json.Unmarshal([]byte(line), &tick)
 		if err != nil {
-			fmt.Printf("Error parsing JSON on line %d: %v\n", totalRecords+skippedRecords+1, err)
 			skippedRecords++
 			continue
 		}
@@ -111,6 +115,17 @@ func main() {
 			exchTime := time.Unix(tick.ExchTimestamp, 0)
 			recvTime := time.Unix(0, tick.RecvTimestamp)
 
+			// Assign to 15-minute bucket
+			bucketKey := exchTime.Truncate(time.Duration(chunkMinutes) * time.Minute).Unix()
+			b, ok := buckets[bucketKey]
+			if !ok {
+				b = &BucketStats{SymbolCounts: make(map[string]int64)}
+				buckets[bucketKey] = b
+			}
+
+			b.TotalRecords++
+			b.SymbolCounts[tick.Symbol]++
+
 			// Update total time windows
 			if exchStartTime.IsZero() || exchTime.Before(exchStartTime) {
 				exchStartTime = exchTime
@@ -126,12 +141,14 @@ func main() {
 				localEndTime = recvTime
 			}
 
-			// Calculate Inter-arrival time for this symbol
+			// Calculate Inter-arrival time
 			if lastTime, exists := lastRecvTime[tick.Symbol]; exists {
 				interArrivalTime := recvTime.Sub(lastTime)
-				if interArrivalTime > 0 { // Ignore out of order or simultaneous ticks for avg
+				if interArrivalTime > 0 {
 					totalInterArrivalTime += interArrivalTime
 					interArrivalCount++
+					b.TotalInterArrival += interArrivalTime
+					b.InterArrivalCount++
 					
 					if interArrivalTime < minInterArrivalTime {
 						minInterArrivalTime = interArrivalTime
@@ -144,8 +161,9 @@ func main() {
 			lastRecvTime[tick.Symbol] = recvTime
 
 			latency := recvTime.Sub(exchTime)
-			
 			totalLatency += latency
+			b.TotalLatency += latency
+
 			if latency < minLatency {
 				minLatency = latency
 			}
@@ -165,16 +183,12 @@ func main() {
 	}
 
 	fmt.Println("==================================================")
-	fmt.Println(" Tick Data Analytics Report ")
+	fmt.Println(" Tick Data Analytics Report (Global) ")
 	fmt.Println("==================================================")
 	fmt.Printf("Total Records Processed : %d\n", totalRecords)
 	
 	if !exchStartTime.IsZero() {
 		fmt.Printf("Exchange Time Window    : %s to %s (IST)\n", exchStartTime.In(istLoc).Format("15:04:05"), exchEndTime.In(istLoc).Format("15:04:05"))
-		fmt.Printf("Local App Time Window   : %s to %s (IST) (Duration: %v)\n", 
-			localStartTime.In(istLoc).Format("15:04:05"), 
-			localEndTime.In(istLoc).Format("15:04:05"),
-			localEndTime.Sub(localStartTime).Round(time.Second))
 	}
 
 	if skippedRecords > 0 {
@@ -208,30 +222,52 @@ func main() {
 		fmt.Printf("  %s : %d ticks (%.1f%%)\n", sym, count, float64(count)/baseCount*100)
 	}
 
-	fmt.Println("\n--- Latency Metrics ---")
-	fmt.Println(" * Note: Exchange time is provided with 1-second precision.")
-	fmt.Printf("Average Latency         : %v\n", time.Duration(int64(totalLatency)/totalRecords))
-	if minLatency != time.Hour {
-		fmt.Printf("Minimum Latency         : %v\n", minLatency)
-		fmt.Printf("Maximum Latency         : %v\n", maxLatency)
-	}
 
-	fmt.Println("\n--- Frequency / Throughput ---")
+	fmt.Println("\n--- Frequency / Throughput (Global) ---")
 	if interArrivalCount > 0 {
 		avgInterArrival := time.Duration(int64(totalInterArrivalTime) / interArrivalCount)
-		fmt.Printf("Avg Time Between Ticks  : %v\n", avgInterArrival)
-		
-		if minInterArrivalTime != time.Hour {
-			fmt.Printf("Min Time Between Ticks  : %v\n", minInterArrivalTime)
-			fmt.Printf("Max Time Between Ticks  : %v\n", maxInterArrivalTime)
-		}
+		fmt.Printf("Global Avg Time Between Ticks  : %v\n", avgInterArrival)
 
 		var ticksPerSecond float64 = 0
 		if avgInterArrival.Seconds() > 0 {
 			ticksPerSecond = 1.0 / avgInterArrival.Seconds()
 		}
-		fmt.Printf("Implied Updates/Sec     : %.2f ticks/sec per symbol\n", ticksPerSecond)
+		fmt.Printf("Global Implied Updates/Sec     : %.2f ticks/sec per symbol\n", ticksPerSecond)
 	}
 
+	fmt.Println("\n==================================================")
+	fmt.Printf(" Time-Interval Breakdown (%.0f-Minute Buckets)\n", chunkMinutes)
 	fmt.Println("==================================================")
+
+	var keys []int64
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	for _, k := range keys {
+		b := buckets[k]
+		windowStart := time.Unix(k, 0).In(istLoc)
+		windowEnd := windowStart.Add(time.Duration(chunkMinutes) * time.Minute)
+		
+		fmt.Printf("\n[%s - %s IST]\n", windowStart.Format("15:04"), windowEnd.Format("15:04"))
+		fmt.Printf("  Total Ticks : %d\n", b.TotalRecords)
+		
+		if b.TotalRecords > 0 {
+			avgLat := time.Duration(int64(b.TotalLatency) / b.TotalRecords)
+			fmt.Printf("  Avg Latency : %v\n", avgLat)
+		}
+
+		if b.InterArrivalCount > 0 {
+			avgArrival := time.Duration(int64(b.TotalInterArrival) / b.InterArrivalCount)
+			updatesPerSec := 0.0
+			if avgArrival.Seconds() > 0 {
+				updatesPerSec = 1.0 / avgArrival.Seconds()
+			}
+			fmt.Printf("  Throughput  : %.2f ticks/sec\n", updatesPerSec)
+		} else {
+			fmt.Printf("  Throughput  : 0.00 ticks/sec\n")
+		}
+	}
+	fmt.Println("\n==================================================")
 }

@@ -11,10 +11,11 @@ import (
 )
 
 type FyersWSClient struct {
-	socket     *fyersws.FyersDataSocket
-	ringBuffer *RingBuffer
-	logger     *slog.Logger
-	symbols    []string
+	socket          *fyersws.FyersDataSocket
+	ringBuffer      *RingBuffer
+	logger          *slog.Logger
+	symbols         []string
+	OnInvalidSymbol func(invalidSymbols []string) // Callback for pipeline fallback
 }
 
 func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *FyersWSClient {
@@ -37,6 +38,23 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 
 	onError := func(message fyersws.DataError) {
 		client.logger.Error("WebSocket Error", "error", message)
+		
+		// If Fyers rejects our symbols, parse out the list and trigger fallback
+		if client.OnInvalidSymbol != nil {
+			if invalidRaw, ok := message["invalid_symbols"]; ok {
+				if invalidList, ok := invalidRaw.([]interface{}); ok {
+					var invalidStrs []string
+					for _, v := range invalidList {
+						if str, isStr := v.(string); isStr {
+							invalidStrs = append(invalidStrs, str)
+						}
+					}
+					if len(invalidStrs) > 0 {
+						client.OnInvalidSymbol(invalidStrs)
+					}
+				}
+			}
+		}
 	}
 
 	onMessage := func(message fyersws.DataResponse) {

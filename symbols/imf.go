@@ -27,15 +27,24 @@ type IMFManager struct {
 
 	// Sorted list of valid weekly/monthly expiry dates for Nifty
 	niftyExpiryDates []time.Time
+	// Full set of valid Nifty option symbols from the IMF — used for quick validation.
+	niftySymbols map[string]struct{}
+	// Strikes available per expiry + option type.
+	niftyStrikesByExpiry map[string][]int
+	// Exact 5-char expiry code used by Fyers for this date (handles YYMdd vs YYMMM)
+	niftyExpiryCodes map[string]string
 	cacheDirPath     string
 }
 
 // NewIMFManager creates a new instance.
 func NewIMFManager(logger *slog.Logger, cacheDirPath string) *IMFManager {
 	return &IMFManager{
-		logger:           logger,
-		niftyExpiryDates: make([]time.Time, 0),
-		cacheDirPath:     cacheDirPath,
+		logger:               logger,
+		niftyExpiryDates:     make([]time.Time, 0),
+		niftySymbols:         make(map[string]struct{}),
+		niftyStrikesByExpiry: make(map[string][]int),
+		niftyExpiryCodes:     make(map[string]string),
+		cacheDirPath:         cacheDirPath,
 	}
 }
 
@@ -62,23 +71,97 @@ func (m *IMFManager) GetNiftyExpiries() []time.Time {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Return a copy to prevent external modification
 	cp := make([]time.Time, len(m.niftyExpiryDates))
 	copy(cp, m.niftyExpiryDates)
 	return cp
 }
 
+// SymbolExists reports whether the given symbol string exists in the current IMF data.
+// Returns false for any symbol not published by Fyers (wrong strike, wrong expiry, etc).
+func (m *IMFManager) SymbolExists(symbol string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.niftySymbols[symbol]
+	return ok
+}
+
+// FindNearestStrike returns the closest available strike price to targetStrike for
+// the given expiry date and option type ("CE" or "PE").
+func (m *IMFManager) FindNearestStrike(expiry time.Time, targetStrike int, optType string) (int, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	key := expiry.Format("2006-01-02") + ":" + optType
+	strikes, ok := m.niftyStrikesByExpiry[key]
+	if !ok || len(strikes) == 0 {
+		return 0, false
+	}
+
+	// Binary search for insertion point, then compare neighbours
+	lo, hi := 0, len(strikes)-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if strikes[mid] < targetStrike {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	// lo is the first element >= targetStrike
+	best := strikes[lo]
+	if lo > 0 {
+		below := strikes[lo-1]
+		if abs(below-targetStrike) < abs(best-targetStrike) {
+			best = below
+		}
+	}
+	return best, true
+}
+
+// GetExpiryCode returns the exact 5-character string Fyers uses for this date
+// (e.g., "26324" for weekly or "26MAR" for monthly).
+func (m *IMFManager) GetExpiryCode(expiry time.Time) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.niftyExpiryCodes[expiry.Format("2006-01-02")]
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func istLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		// Fallback: UTC+5:30
+		return time.FixedZone("IST", 5*3600+30*60)
+	}
+	return loc
+}
+
 func (m *IMFManager) ensureIMFCached() error {
 	path := filepath.Join(m.cacheDirPath, cacheFileName)
+	ist := istLocation()
 
-	// Check if file exists and is less than 12 hours old
+	// Refresh if file doesn't exist OR if it was written on a previous IST calendar day.
+	// This guarantees fresh data every trading morning regardless of the machine's timezone
+	// (EC2 runs in UTC — a 12h rolling check would break across midnight IST).
 	info, err := os.Stat(path)
 	if err == nil {
-		if time.Since(info.ModTime()) < 12*time.Hour {
-			m.logger.Info("Using cached IMF file", "path", path, "age", time.Since(info.ModTime()).String())
+		nowIST := time.Now().In(ist)
+		fileIST := info.ModTime().In(ist)
+		sameDay := nowIST.Year() == fileIST.Year() &&
+			nowIST.Month() == fileIST.Month() &&
+			nowIST.Day() == fileIST.Day()
+		if sameDay {
+			m.logger.Info("Using cached IMF file (same IST trading day)",
+				"path", path, "age", time.Since(info.ModTime()).Round(time.Minute).String())
 			return nil
 		}
-		m.logger.Info("Cached IMF file is older than 12 hours, replacing", "path", path)
+		m.logger.Info("Cached IMF file is from a previous IST trading day — refreshing", "path", path)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -130,13 +213,13 @@ func (m *IMFManager) parseNiftyExpiries() error {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	// We might have different number of fields depending on updates
-	reader.FieldsPerRecord = -1 
+	reader.FieldsPerRecord = -1
 
+	ist := istLocation()
 	uniqueDates := make(map[string]time.Time)
-	now := time.Now()
-	// To avoid issues with intraday expiry processing, we'll keep today's expiry as well.
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	nowIST := time.Now().In(ist)
+	// Keep today's expiry (for expiry-day morning trading) and all future ones.
+	todayStartIST := time.Date(nowIST.Year(), nowIST.Month(), nowIST.Day(), 0, 0, 0, 0, ist)
 
 	lineCount := 0
 	for {
@@ -150,33 +233,60 @@ func (m *IMFManager) parseNiftyExpiries() error {
 		}
 		lineCount++
 
-		// Example schema line:
-		// 101126033051701,BANKNIFTY 30 Mar 26 FUT,11,30,0.2,,0915-1530|1815-1915:,2026-03-30,1774864800,NSE:BANKNIFTY26MARFUT,10,11,51701,BANKNIFTY,26009,-1.0,XX,101000000026009,None,0,0.0
-		// Column 8 (index 8) -> 1774864800 (Expiry Timestamp Unix)
-		// Column 9 (index 9) -> NSE:BANKNIFTY26MARFUT (Symbol string)
-
 		if len(record) > 10 {
 			symbol := record[9]
-			// We only care about Nifty Options
+			// We only care about Nifty Options (CE or PE)
 			if strings.HasPrefix(symbol, "NSE:NIFTY") && (strings.HasSuffix(symbol, "CE") || strings.HasSuffix(symbol, "PE")) {
-				
-				// Expiry timestamp
-				expiryTsStr := record[8]
-				expiryUnix, err := strconv.ParseInt(expiryTsStr, 10, 64)
-				if err != nil {
-					continue
-				}
+				// Prevent matching NSE:NIFTYNXT50, NSE:NIFTYMID50, etc.
+				// Genuine NIFTY 50 options are immediately followed by the 2-digit year (e.g., '2' for 2024/2025/2026)
+				if len(symbol) > 9 && symbol[9] >= '0' && symbol[9] <= '9' {
+					// Column 8 = Unix expiry timestamp (always UTC from Fyers)
+					expiryUnix, err := strconv.ParseInt(record[8], 10, 64)
+					if err != nil {
+						continue
+					}
 
-				expiryTime := time.Unix(expiryUnix, 0).Local()
-				// Truncate to day start for unique-ing
-				expiryDay := time.Date(expiryTime.Year(), expiryTime.Month(), expiryTime.Day(), 0, 0, 0, 0, time.Local)
-				
-				if !expiryDay.Before(todayStart) {
-					dateKey := expiryDay.Format("2006-01-02")
-					uniqueDates[dateKey] = expiryDay
+				// Convert to IST for correct date comparison regardless of machine timezone
+					expiryIST := time.Unix(expiryUnix, 0).In(ist)
+					expiryDayIST := time.Date(expiryIST.Year(), expiryIST.Month(), expiryIST.Day(), 0, 0, 0, 0, ist)
+
+					if !expiryDayIST.Before(todayStartIST) {
+						dateKey := expiryDayIST.Format("2006-01-02")
+						uniqueDates[dateKey] = expiryDayIST
+						// Cache symbol for O(1) lookup
+						m.niftySymbols[symbol] = struct{}{}
+
+						// Extract strike from symbol and add to per-expiry strike index.
+						// Symbol format: NSE:NIFTY{YYMDD}{STRIKE}{CE|PE}
+						// Strip prefix "NSE:NIFTY" and suffix "CE"/"PE" then expiry code (5 chars)
+						var optType string
+						if strings.HasSuffix(symbol, "CE") {
+							optType = "CE"
+						} else {
+							optType = "PE"
+						}
+						inner := strings.TrimPrefix(symbol, "NSE:NIFTY")
+						inner = strings.TrimSuffix(strings.TrimSuffix(inner, "CE"), "PE")
+						// inner = expiryCode (5 chars) + strike; expiry code is always 5 chars (either YYMdd or YYMMM)
+						if len(inner) > 5 {
+							expiryCode := inner[:5]
+							m.niftyExpiryCodes[dateKey] = expiryCode
+							
+							strikeStr := inner[5:]
+							if strike, err := strconv.Atoi(strikeStr); err == nil {
+								strikesKey := dateKey + ":" + optType
+								m.niftyStrikesByExpiry[strikesKey] = append(m.niftyStrikesByExpiry[strikesKey], strike)
+							}
+						}
+					}
 				}
 			}
 		}
+	}
+
+	// Sort each expiry's strike list for binary-search in FindNearestStrike
+	for key := range m.niftyStrikesByExpiry {
+		sort.Ints(m.niftyStrikesByExpiry[key])
 	}
 
 	m.logger.Info("Parsed IMF lines", "total_lines", lineCount)
@@ -186,14 +296,14 @@ func (m *IMFManager) parseNiftyExpiries() error {
 		m.niftyExpiryDates = append(m.niftyExpiryDates, d)
 	}
 
-	// Sort dates from nearest to furthest
+	// Sort nearest → furthest
 	sort.Slice(m.niftyExpiryDates, func(i, j int) bool {
 		return m.niftyExpiryDates[i].Before(m.niftyExpiryDates[j])
 	})
 
 	m.logger.Info("Extracted Nifty expiries", "count", len(m.niftyExpiryDates))
 	if len(m.niftyExpiryDates) > 0 {
-		m.logger.Info("Next upcoming expiry", "date", m.niftyExpiryDates[0].Format("2006-01-02"))
+		m.logger.Info("Next upcoming expiry", "date", m.niftyExpiryDates[0].Format("2006-01-02 (Monday)"))
 	}
 
 	return nil

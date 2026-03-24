@@ -24,23 +24,3 @@ func GetTradingExpiry(imf *IMFManager, cfg *config.TradingConfig) (time.Time, er
 	return expiries[weekIdx], nil
 }
 
-// FormatExpiryForSymbol formats a date to Fyers symbol convention
-// YYMDD (YY=2-digit year, M=1-9,O,N,D, DD=2-digit day). Example: "26317"
-func FormatExpiryForSymbol(date time.Time) string {
-	year := date.Year() % 100
-	month := date.Month()
-	day := date.Day()
-
-	monthChar := ""
-	if month <= 9 {
-		monthChar = fmt.Sprintf("%d", month)
-	} else if month == 10 {
-		monthChar = "O"
-	} else if month == 11 {
-		monthChar = "N"
-	} else if month == 12 {
-		monthChar = "D"
-	}
-
-	return fmt.Sprintf("%02d%s%02d", year, monthChar, day)
-}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"fyers-trading/config"
+	"fyers-trading/infra"
 	"fyers-trading/marketdata"
 	"fyers-trading/symbols"
 )
@@ -87,6 +89,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 1.7 Connect Redis (graceful: falls back to NoopStore if unavailable)
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	store, usingRedis := infra.ConnectStore(ctx, appCfg.RedisURL, logger)
+	defer store.Close()
+	if !usingRedis {
+		logger.Warn("Running without Redis — crash recovery disabled")
+	}
+
 	// 2. Initialize Market Data Infrastructure
 	ringBuffer := marketdata.NewRingBuffer(appCfg.RingBufferSize)
 
@@ -107,7 +119,7 @@ func main() {
 
 	// We declare wsClient here so we can inject it into the Pipeline
 	wsClient := marketdata.NewFyersWSClient(wsToken, ringBuffer, logger)
-	pipeline := symbols.NewPipeline(logger, wsClient, tradingCfg, imfManager)
+	pipeline := symbols.NewPipeline(logger, wsClient, tradingCfg, imfManager, store)
 
 	// Thread 2: The Pipeline (Takes one read cursor, computes symbol rules dynamically)
 	go func() {
@@ -147,6 +159,8 @@ func main() {
 		}
 	}()
 
+
+
 	// 3. Start WS Client connecting
 	if err := wsClient.Connect(); err != nil {
 		logger.Error("Failed to connect to Fyers WebSocket", "error", err)
@@ -158,17 +172,44 @@ func main() {
 		"NSE:NIFTY50-INDEX",
 	})
 
-	// Wait for termination
+	// Wait for termination (OS signal or Market Close)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
 
-	logger.Info("Received shutdown signal, terminating...")
+	<-sigChan
+	logger.Info("Received OS shutdown signal, terminating...")
+
+	// Cancel context — signals the Replicator to flush one final snapshot
+	cancelCtx()
 	wsClient.Close()
 	// Close ring buffer to signal all reader goroutines to exit gracefully
 	ringBuffer.Close()
 
 	<-doneChan
+
+	if usingRedis {
+		logger.Info("Exporting Redis state to local file...")
+		// Use a fresh context since the parent ctx is already canceled during shutdown
+		exportCtx, cancelExport := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelExport()
+
+		data, err := infra.ExportStateJSON(exportCtx, store)
+		if err == nil {
+			err = os.MkdirAll("logs", 0755)
+			if err == nil {
+				err = os.WriteFile("logs/redis_export.json", data, 0644)
+				if err == nil {
+					logger.Info("Successfully exported Redis state to logs/redis_export.json")
+				} else {
+					logger.Error("Failed to write redis_export.json", "error", err)
+				}
+			} else {
+				logger.Error("Failed to create logs directory", "error", err)
+			}
+		} else {
+			logger.Error("Failed gracefully dumping Redis state", "error", err)
+		}
+	}
 
 	logger.Info("Writing captured ticks to ticks.txt...", "total_ticks", len(ticksLog))
 	file, err := os.Create("ticks.txt")

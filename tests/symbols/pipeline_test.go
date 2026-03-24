@@ -34,7 +34,7 @@ func newTestPipeline(t *testing.T, cfg *config.TradingConfig) (*symbols.Pipeline
 		t.Skip("Skipping test because IMF could not be downloaded/initialized: ", err)
 	}
 	wsClient := marketdata.NewFyersWSClient("dummy", nil, logger)
-	pipeline := symbols.NewPipeline(logger, wsClient, cfg, imf)
+	pipeline := symbols.NewPipeline(logger, wsClient, cfg, imf, nil)
 	pipeline.SetInitialState(23455.0) // ATM: 23450
 	initialSyms := pipeline.GetActiveSymbols()
 	return pipeline, initialSyms

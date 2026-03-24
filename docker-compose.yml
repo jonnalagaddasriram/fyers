@@ -1,0 +1,58 @@
+services:
+  # ─────────────────────────────────────────────
+  # Redis: in-memory state store + crash recovery
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: fyers-redis
+    restart: unless-stopped
+    # Persist to disk: save a snapshot every 60s if at least 1 key changed.
+    # This means Redis survives a Docker restart with full state intact.
+    command: redis-server --save 60 1 --loglevel warning
+    network_mode: "host"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ─────────────────────────────────────────────
+  # fyers-trading: the main Go application
+  # ─────────────────────────────────────────────
+  fyers-trading:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fyers-trading
+    restart: unless-stopped
+    network_mode: "host"
+    env_file:
+      - .env
+    environment:
+      # Override Redis URL to use the host's loopback interface natively
+      - REDIS_URL=redis://127.0.0.1:6379/0
+    volumes:
+      # Mount trading.json for hot-reload without rebuild
+      - ./trading.json:/app/trading.json:ro
+      # Mount data/ directory for IMF cache (NSE_FO.csv)
+      - ./data:/app/data
+      # Mount logs to host for inspection
+      - ./logs:/app/logs
+      # Mount ticks.txt so market data saves directly to host
+      - ./ticks.txt:/app/ticks.txt
+      # Mount pipeline_events.txt so pipeline events save directly to host
+      - ./pipeline_events.txt:/app/pipeline_events.txt
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  redis_data:
+    # Named volume — survives docker compose down (use 'docker compose down -v' to wipe)

@@ -8,7 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"context"
 	"fyers-trading/config"
+	"fyers-trading/infra"
 	"fyers-trading/marketdata"
 )
 
@@ -71,12 +73,14 @@ type Pipeline struct {
 	cfg       *config.TradingConfig
 	imf       *IMFManager
 	evtLogger *EventLogger
+	store     infra.Store // Redis state persistence (NoopStore in dev)
 
 	mu sync.Mutex
 
 	// Current active state
-	activeATM     int
-	activeSymbols []string
+	activeATM          int
+	activeSymbols      []string
+	activeExpiryOffset int // Automatically increments if Fyers rejects an expiry
 
 	// Track last seen Nifty LTP for post-cycle live ATM check
 	lastNiftyLTP float64
@@ -84,39 +88,78 @@ type Pipeline struct {
 	// History of pending shifts during an active countdown
 	pendingShifts []PendingShift
 
-	shiftTimer     *time.Timer
-	timerTarget    time.Time
+	shiftTimer       *time.Timer
+	timerTarget      time.Time
 	// Absolute deadline: timer can never fire later than this.
 	maxTimerDeadline time.Time
 }
 
-func NewPipeline(logger *slog.Logger, client *marketdata.FyersWSClient, cfg *config.TradingConfig, imf *IMFManager) *Pipeline {
-	return &Pipeline{
+func NewPipeline(logger *slog.Logger, client *marketdata.FyersWSClient, cfg *config.TradingConfig, imf *IMFManager, store infra.Store) *Pipeline {
+	if store == nil {
+		store = infra.NewNoopStore()
+	}
+	p := &Pipeline{
 		logger:        logger,
 		client:        client,
 		cfg:           cfg,
 		imf:           imf,
+		store:         store,
 		evtLogger:     NewEventLogger("pipeline_events.txt"),
 		pendingShifts: make([]PendingShift, 0),
 	}
+
+	// Wire Fyers websocket rejection feedback into the pipeline
+	p.client.OnInvalidSymbol = p.handleInvalidSymbols
+
+	return p
 }
 
-// SetInitialState is called on boot. It uses the current Nifty LTP to set the base ATM.
+// SetInitialState is called on boot. It first tries to restore from Redis.
+// If Redis has a saved state, restores it immediately (skip first tick wait).
+// If not, falls back to computing ATM from the live Nifty LTP.
 func (p *Pipeline) SetInitialState(niftyLTP float64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Try to restore last-known state from Redis
+	restoredATM, restoredSyms, found, err := p.store.LoadPipelineState(ctx)
+	if err != nil {
+		p.logger.Warn("Could not load pipeline state from Redis, using live Nifty LTP", "error", err)
+	}
+
+	if found && restoredATM > 0 && len(restoredSyms) > 0 {
+		p.activeATM = restoredATM
+		p.activeSymbols = restoredSyms
+		p.client.Subscribe(restoredSyms)
+		p.logger.Info("Pipeline state RESTORED from Redis",
+			"atm", p.activeATM, "symbols", p.activeSymbols)
+		p.evtLogger.Log("RESTORED", p.activeATM, restoredSyms, fmt.Sprintf("Nifty LTP=%.2f (restored from Redis)", niftyLTP))
+		return nil
+	}
+
+	// No Redis state — compute fresh from live LTP
 	p.activeATM = ComputeATMStrike(niftyLTP)
 	syms, err := p.calculateSymbols(p.activeATM)
 	if err != nil {
 		return fmt.Errorf("failed to calculate initial symbols: %w", err)
 	}
-
 	p.activeSymbols = syms
 	p.client.Subscribe(syms)
-	
 	p.logger.Info("Pipeline initialized with Active ATM", "atm", p.activeATM, "symbols", p.activeSymbols)
 	p.evtLogger.Log("INIT", p.activeATM, syms, fmt.Sprintf("Nifty LTP=%.2f", niftyLTP))
+
+	// Persist the initialized state to Redis immediately
+	go func(atm int, currentSyms []string) {
+		saveCtx, cancelSave := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelSave()
+		if err := p.store.SavePipelineState(saveCtx, atm, currentSyms); err != nil {
+			p.logger.Warn("Failed to persist initial pipeline state to Redis", "error", err)
+		}
+	}(p.activeATM, syms)
+
 	return nil
 }
 
@@ -256,6 +299,15 @@ func (p *Pipeline) evaluateShifts() {
 	p.logger.Info("====== PIPELINE CONFIRMED NEW ACTIVE ATM ======", "atm", p.activeATM, "symbols", p.activeSymbols)
 	p.evtLogger.Log("ACTIVE_SWITCH", p.activeATM, p.activeSymbols, "confirmed after timer")
 
+	// Persist to Redis for crash recovery (non-blocking, best-effort)
+	go func(atm int, syms []string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := p.store.SavePipelineState(ctx, atm, syms); err != nil {
+			p.logger.Warn("Failed to persist pipeline state to Redis", "error", err)
+		}
+	}(p.activeATM, append([]string{}, p.activeSymbols...))
+
 	// POST-CYCLE CHECK: Is the live ATM already different from what we just confirmed?
 	// This catches cases where the market moved 1-2 strikes during a long oscillation window
 	// and the confirmed shift is already stale by the time the timer fired.
@@ -329,18 +381,130 @@ func (p *Pipeline) evaluateShifts() {
 	}
 }
 
+// calculateSymbols builds the CE and PE option symbols for the given ATM strike.
+//
+// Flow:
+//  1. Lock the expiry at expiry_week index from config.
+//  2. Get all available CE and PE strikes for that expiry from the IMF.
+//  3. Snap the ideal strike to the nearest available one.
+//  4. Only advance to the next expiry if the locked expiry has ZERO strikes
+//     (i.e. it genuinely doesn't exist in the current IMF data).
+//
+// Weekly and monthly contracts both use 50-pt intervals (monthly sometimes 25-pt),
+// so snapping is always safe — we never need to cross-expiry boundaries for strikes.
 func (p *Pipeline) calculateSymbols(atm int) ([]string, error) {
-	expiry, err := GetTradingExpiry(p.imf, p.cfg)
-	if err != nil {
-		return nil, err
+	expiries := p.imf.GetNiftyExpiries()
+	if len(expiries) == 0 {
+		return nil, fmt.Errorf("no Nifty expiries found in IMF — IMF reload required")
 	}
-	expiryStr := FormatExpiryForSymbol(expiry)
 
-	ceStrike := ComputeCEStrike(atm, p.cfg)
-	peStrike := ComputePEStrike(atm, p.cfg)
+	// Start at config week + any dynamic offset triggered by WS rejections
+	weekIdx := p.cfg.GetExpiryWeek() + p.activeExpiryOffset
+	if weekIdx < 0 {
+		weekIdx = 0
+	}
 
-	ceSym := BuildOptionSymbol(expiryStr, ceStrike, "CE")
-	peSym := BuildOptionSymbol(expiryStr, peStrike, "PE")
+	idealCE := ComputeCEStrike(atm, p.cfg)
+	idealPE := ComputePEStrike(atm, p.cfg)
 
+	for i := weekIdx; i < len(expiries); i++ {
+		exp := expiries[i]
+		expiryStr := p.imf.GetExpiryCode(exp)
+		expiryLabel := exp.Format("2006-01-02 (Mon)")
+
+		// Find nearest available CE and PE strikes for this expiry.
+		nearCE, ceOK := p.imf.FindNearestStrike(exp, idealCE, "CE")
+		nearPE, peOK := p.imf.FindNearestStrike(exp, idealPE, "PE")
+
+		if !ceOK || !peOK {
+			// This expiry has no strikes in the IMF at all — move to next.
+			if i == weekIdx {
+				p.logger.Warn("Configured expiry has no strikes in IMF — trying next",
+					"expiry", expiryLabel, "expiry_week", weekIdx)
+			}
+			continue
+		}
+
+		ceSym := BuildOptionSymbol(expiryStr, nearCE, "CE")
+		peSym := BuildOptionSymbol(expiryStr, nearPE, "PE")
+
+		if nearCE == idealCE && nearPE == idealPE {
+			p.logger.Info("Symbols resolved (exact strike)",
+				"expiry", expiryLabel, "ce", ceSym, "pe", peSym)
+		} else {
+			p.logger.Info("Symbols resolved (snapped to nearest available strike)",
+				"expiry", expiryLabel,
+				"ideal_ce", idealCE, "used_ce", nearCE,
+				"ideal_pe", idealPE, "used_pe", nearPE,
+				"ce", ceSym, "pe", peSym)
+		}
+		if i > weekIdx {
+			p.logger.Warn("Fell back to a later expiry",
+				"configured_week", weekIdx, "used_week", i, "expiry", expiryLabel)
+		}
+		return []string{ceSym, peSym}, nil
+	}
+
+	// Absolute fallback — no expiry found in IMF at all
+	fallbackExp := expiries[weekIdx]
+	expiryStr := p.imf.GetExpiryCode(fallbackExp)
+	if expiryStr == "" {
+		// Just in case we didn't have it mapped somehow
+		expiryStr = fallbackExp.Format("06") + "MON" 
+	}
+	ceSym := BuildOptionSymbol(expiryStr, idealCE, "CE")
+	peSym := BuildOptionSymbol(expiryStr, idealPE, "PE")
+	p.logger.Error("No expiry with available strikes found in IMF — subscribing with computed symbols",
+		"ce", ceSym, "pe", peSym)
 	return []string{ceSym, peSym}, nil
+}
+
+// handleInvalidSymbols is triggered asynchronously when the Fyers WS client receives an "invalid_symbols" error.
+func (p *Pipeline) handleInvalidSymbols(invalid []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Double-check these are actually our current target symbols
+	// (just in case it's a delayed error message for an old subscription)
+	isCurrent := false
+	for _, inv := range invalid {
+		for _, cur := range p.activeSymbols {
+			if inv == cur {
+				isCurrent = true
+				break
+			}
+		}
+	}
+
+	if !isCurrent {
+		p.logger.Debug("Received invalid_symbols error for non-active symbols", "symbols", invalid)
+		return
+	}
+
+	p.logger.Warn("Exchange rejected the requested symbols — walking forward to next expiry",
+		"rejected", invalid,
+		"old_offset", p.activeExpiryOffset,
+		"new_offset", p.activeExpiryOffset+1)
+
+	// Increment offset and trigger a recalculation
+	p.activeExpiryOffset++
+	
+	syms, err := p.calculateSymbols(p.activeATM)
+	if err != nil {
+		p.logger.Error("Failed to calculate fallback symbols after rejection", "err", err)
+		return
+	}
+
+	p.activeSymbols = syms
+	p.client.Subscribe(syms)
+	p.evtLogger.Log("FALLBACK", p.activeATM, syms, fmt.Sprintf("WS Rejected previous expiry (offset %d)", p.activeExpiryOffset))
+	
+	// Ensure the new valid state makes it to Redis
+	go func(atm int, currentSyms []string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := p.store.SavePipelineState(ctx, atm, currentSyms); err != nil {
+			p.logger.Error("Failed to save fallback pipeline state to Redis", "err", err)
+		}
+	}(p.activeATM, syms)
 }
