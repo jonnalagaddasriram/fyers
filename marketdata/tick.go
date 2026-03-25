@@ -2,7 +2,16 @@ package marketdata
 
 import "sync"
 
-// TickEvent represents a normalized tick from the exchange
+// DepthLevel holds one level of 5-level market depth (from DepthUpdate feed).
+type DepthLevel struct {
+	Price  float64
+	Size   int64
+	Orders int64
+}
+
+// TickEvent represents a normalized tick from the exchange.
+// Depth fields are only populated for CE/PE option ticks (DepthUpdate feed).
+// Index ticks (SymbolUpdate feed) only populate the top-level OHLC/LTP fields.
 type TickEvent struct {
 	Symbol        string
 	LTP           float64
@@ -11,14 +20,14 @@ type TickEvent struct {
 	Low           float64
 	Close         float64
 	Volume        int64
-	BidPrice      float64
-	AskPrice      float64
-	BidSize       int64
-	AskSize       int64
 	Change        float64
 	ChangePercent float64
-	ExchTimestamp int64 // timestamp from exchange (seconds)
+	ExchTimestamp int64 // timestamp from exchange (seconds); absent in DepthUpdate
 	RecvTimestamp int64 // time.Now().UnixNano() at receive
+
+	// 5-level market depth (DepthUpdate only)
+	Bid [5]DepthLevel
+	Ask [5]DepthLevel
 }
 
 // pool allows zero-allocation hot-path for TickEvents

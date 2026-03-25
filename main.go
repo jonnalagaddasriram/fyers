@@ -114,7 +114,8 @@ func main() {
 	testReader := ringBuffer.NewReader()
 	pipelineReader := ringBuffer.NewReader()
 
-	ticksLog := make([]marketdata.TickEvent, 0, 500000)
+	// optionTicksLog captures only CE/PE option ticks (not the index) for post-run analytics.
+	optionTicksLog := make([]marketdata.TickEvent, 0, 500000)
 	doneChan := make(chan bool)
 
 	// We declare wsClient here so we can inject it into the Pipeline
@@ -146,6 +147,7 @@ func main() {
 	}()
 
 	// Thread 3: The Logger / Final Memory array (Takes a second read cursor)
+	// Only records CE/PE option ticks — index ticks are excluded from disk analysis.
 	go func() {
 		for {
 			tick := testReader.Next()
@@ -153,9 +155,14 @@ func main() {
 				close(doneChan)
 				return
 			}
-			
+
+			// Skip index ticks — only store CE/PE option data for analytics
+			if tick.Symbol == "NSE:NIFTY50-INDEX" {
+				continue
+			}
+
 			// Store a struct copy so we don't accidentally maintain pointers to pooled objects
-			ticksLog = append(ticksLog, *tick)
+			optionTicksLog = append(optionTicksLog, *tick)
 		}
 	}()
 
@@ -167,8 +174,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Subscribe only to the index initially. The Pipeline takes over the options!
-	wsClient.Subscribe([]string{
+	// Subscribe to the index via SymbolUpdate (lightweight LTP feed — separate from CE/PE depth).
+	wsClient.SubscribeIndex([]string{
 		"NSE:NIFTY50-INDEX",
 	})
 
@@ -211,16 +218,16 @@ func main() {
 		}
 	}
 
-	logger.Info("Writing captured ticks to ticks.txt...", "total_ticks", len(ticksLog))
+	logger.Info("Writing captured CE/PE option ticks to ticks.txt...", "total_option_ticks", len(optionTicksLog))
 	file, err := os.Create("ticks.txt")
 	if err == nil {
-		for _, t := range ticksLog {
+		for _, t := range optionTicksLog {
 			b, _ := json.Marshal(t)
 			file.Write(b)
 			file.WriteString("\n")
 		}
 		file.Close()
-		logger.Info("Successfully saved ticks to ticks.txt")
+		logger.Info("Successfully saved CE/PE option ticks to ticks.txt")
 	} else {
 		logger.Error("Failed to write to file", "error", err)
 	}

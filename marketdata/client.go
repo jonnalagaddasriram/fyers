@@ -14,21 +14,26 @@ type FyersWSClient struct {
 	socket          *fyersws.FyersDataSocket
 	ringBuffer      *RingBuffer
 	logger          *slog.Logger
-	symbols         []string
+	symbols         []string // CE/PE option symbols (DepthUpdate)
+	indexSymbols    []string // Index symbols (SymbolUpdate)
 	OnInvalidSymbol func(invalidSymbols []string) // Callback for pipeline fallback
 }
 
 func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *FyersWSClient {
 	client := &FyersWSClient{
-		ringBuffer: rb,
-		logger:     logger,
-		symbols:    make([]string, 0),
+		ringBuffer:   rb,
+		logger:       logger,
+		symbols:      make([]string, 0),
+		indexSymbols: make([]string, 0),
 	}
 
 	onConnect := func() {
 		client.logger.Info("WebSocket Connected")
+		if len(client.indexSymbols) > 0 {
+			client.socket.Subscribe(client.indexSymbols, "SymbolUpdate")
+		}
 		if len(client.symbols) > 0 {
-			client.socket.Subscribe(client.symbols, "SymbolUpdate")
+			client.socket.Subscribe(client.symbols, "DepthUpdate")
 		}
 	}
 
@@ -38,7 +43,7 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 
 	onError := func(message fyersws.DataError) {
 		client.logger.Error("WebSocket Error", "error", message)
-		
+
 		// If Fyers rejects our symbols, parse out the list and trigger fallback
 		if client.OnInvalidSymbol != nil {
 			if invalidRaw, ok := message["invalid_symbols"]; ok {
@@ -64,37 +69,26 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 		tick := GetTickEvent()
 		tick.RecvTimestamp = recvTime
 
-		// Parse the map[string]interface{}
+		// Both DepthUpdate and SymbolUpdate carry a "symbol" key
 		if sym, ok := message["symbol"].(string); ok {
 			tick.Symbol = sym
 		} else {
 			PutTickEvent(tick)
-			return // Ignore weird messages
+			return // Ignore malformed messages
 		}
 
+		// Common OHLC / LTP fields (present in SymbolUpdate; may be absent in DepthUpdate)
 		if ltpVal, ok := message["ltp"]; ok {
 			tick.LTP = convertToFloat64(ltpVal)
 		}
 		if volVal, ok := message["vol_traded_today"]; ok {
-			tick.Volume = convertToInt64(volVal) // Volume might be 'vol_traded_today' or 'volume'
+			tick.Volume = convertToInt64(volVal)
 		}
 		if volVal, ok := message["volume"]; ok && tick.Volume == 0 {
 			tick.Volume = convertToInt64(volVal)
 		}
 		if exchTimeVal, ok := message["exch_feed_time"]; ok {
 			tick.ExchTimestamp = convertToInt64(exchTimeVal)
-		}
-		if bidPrice, ok := message["bid_price"]; ok {
-			tick.BidPrice = convertToFloat64(bidPrice)
-		}
-		if askPrice, ok := message["ask_price"]; ok {
-			tick.AskPrice = convertToFloat64(askPrice)
-		}
-		if bidSize, ok := message["bid_size"]; ok {
-			tick.BidSize = convertToInt64(bidSize)
-		}
-		if askSize, ok := message["ask_size"]; ok {
-			tick.AskSize = convertToInt64(askSize)
 		}
 		if openVal, ok := message["open_price"]; ok {
 			tick.Open = convertToFloat64(openVal)
@@ -113,6 +107,30 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 		}
 		if chpVal, ok := message["chp"]; ok {
 			tick.ChangePercent = convertToFloat64(chpVal)
+		}
+
+		// 5-level market depth — only present in DepthUpdate ticks (type="dp").
+		// Keys are 1-indexed: bid_price1…bid_price5, ask_price1…ask_price5, etc.
+		for i := 0; i < 5; i++ {
+			n := i + 1
+			if v, ok := message[fmt.Sprintf("bid_price%d", n)]; ok {
+				tick.Bid[i].Price = convertToFloat64(v)
+			}
+			if v, ok := message[fmt.Sprintf("bid_size%d", n)]; ok {
+				tick.Bid[i].Size = convertToInt64(v)
+			}
+			if v, ok := message[fmt.Sprintf("bid_order%d", n)]; ok {
+				tick.Bid[i].Orders = convertToInt64(v)
+			}
+			if v, ok := message[fmt.Sprintf("ask_price%d", n)]; ok {
+				tick.Ask[i].Price = convertToFloat64(v)
+			}
+			if v, ok := message[fmt.Sprintf("ask_size%d", n)]; ok {
+				tick.Ask[i].Size = convertToInt64(v)
+			}
+			if v, ok := message[fmt.Sprintf("ask_order%d", n)]; ok {
+				tick.Ask[i].Orders = convertToInt64(v)
+			}
 		}
 
 		// Write to ring buffer
@@ -146,19 +164,37 @@ func (c *FyersWSClient) Close() {
 	c.socket.CloseConnection()
 }
 
+// Subscribe subscribes to CE/PE option symbols using DepthUpdate (full order book).
 func (c *FyersWSClient) Subscribe(symbols []string) {
 	c.symbols = append(c.symbols, symbols...)
 	if c.socket != nil {
-		c.socket.Subscribe(symbols, "SymbolUpdate")
-		c.logger.Info("Subscribed to symbols", "symbols", symbols)
+		c.socket.Subscribe(symbols, "DepthUpdate")
+		c.logger.Info("Subscribed to CE/PE symbols (DepthUpdate)", "symbols", symbols)
 	}
 }
 
+// Unsubscribe removes CE/PE option symbols from the DepthUpdate feed.
 func (c *FyersWSClient) Unsubscribe(symbols []string) {
-	// Not perfect symbol tracking here, but Fyers SDK tracks it internally anyway for Unsubscribe
+	if c.socket != nil {
+		c.socket.Unsubscribe(symbols, "DepthUpdate")
+		c.logger.Info("Unsubscribed from CE/PE symbols (DepthUpdate)", "symbols", symbols)
+	}
+}
+
+// SubscribeIndex subscribes to index symbols using SymbolUpdate (LTP-only, lighter feed).
+func (c *FyersWSClient) SubscribeIndex(symbols []string) {
+	c.indexSymbols = append(c.indexSymbols, symbols...)
+	if c.socket != nil {
+		c.socket.Subscribe(symbols, "SymbolUpdate")
+		c.logger.Info("Subscribed to index symbols (SymbolUpdate)", "symbols", symbols)
+	}
+}
+
+// UnsubscribeIndex removes index symbols from the SymbolUpdate feed.
+func (c *FyersWSClient) UnsubscribeIndex(symbols []string) {
 	if c.socket != nil {
 		c.socket.Unsubscribe(symbols, "SymbolUpdate")
-		c.logger.Info("Unsubscribed from symbols", "symbols", symbols)
+		c.logger.Info("Unsubscribed from index symbols (SymbolUpdate)", "symbols", symbols)
 	}
 }
 
