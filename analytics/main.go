@@ -69,20 +69,57 @@ func main() {
 		istLoc = time.Local
 	}
 
-	// ── 1. Parse pipeline_events.txt ─────────────────────────────────────────
+	// ── 1a. Quick first-pass of ticks.txt to find the data window start ──────
+	// pipeline_events.txt is append-only; we use the tick data window to discard
+	// events from previous runs before building phases.
+	var dataStartTime, dataEndTime time.Time
+	if f, err := os.Open("ticks.txt"); err == nil {
+		fsc := bufio.NewScanner(f)
+		fbuf := make([]byte, 0, 1*1024*1024)
+		fsc.Buffer(fbuf, 4*1024*1024)
+		for fsc.Scan() {
+			line := fsc.Text()
+			if line == "" {
+				continue
+			}
+			var t TickEvent
+			if json.Unmarshal([]byte(line), &t) == nil && t.RecvTimestamp > 0 {
+				rt := time.Unix(0, t.RecvTimestamp)
+				if dataStartTime.IsZero() || rt.Before(dataStartTime) {
+					dataStartTime = rt
+				}
+				if rt.After(dataEndTime) {
+					dataEndTime = rt
+				}
+			}
+		}
+		f.Close()
+	}
+
+	// ── 1b. Parse pipeline_events.txt — filter to current run only ────────────
 	var pipelineEvents []PipelineEvent
 	eventsFile, evErr := os.Open("pipeline_events.txt")
 	if evErr == nil {
 		sc := bufio.NewScanner(eventsFile)
+		// Allow events up to 10 min before the first tick (covers the INIT that
+		// fired before any CE/PE tick arrived) but reject everything older.
+		runCutoff := dataStartTime.Add(-10 * time.Minute)
 		for sc.Scan() {
 			line := sc.Text()
 			if line == "" {
 				continue
 			}
 			var ev PipelineEvent
-			if json.Unmarshal([]byte(line), &ev) == nil {
-				pipelineEvents = append(pipelineEvents, ev)
+			if json.Unmarshal([]byte(line), &ev) != nil {
+				continue
 			}
+			if !dataStartTime.IsZero() {
+				t, err := parseIST(ev.Timestamp, istLoc)
+				if err != nil || t.Before(runCutoff) {
+					continue // belongs to a previous run
+				}
+			}
+			pipelineEvents = append(pipelineEvents, ev)
 		}
 		eventsFile.Close()
 	}
@@ -144,7 +181,7 @@ func main() {
 	var maxInterArrivalTime time.Duration = -1
 	var interArrivalCount int64
 
-	var dataStartTime, dataEndTime time.Time
+	// dataStartTime / dataEndTime already declared above in the first-pass scan
 	buckets := make(map[int64]*BucketStats)
 
 	// Per-phase tick tracking: phase index -> per-second tick counts
