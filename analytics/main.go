@@ -101,9 +101,11 @@ func main() {
 	eventsFile, evErr := os.Open("pipeline_events.txt")
 	if evErr == nil {
 		sc := bufio.NewScanner(eventsFile)
-		// Allow events up to 10 min before the first tick (covers the INIT that
-		// fired before any CE/PE tick arrived) but reject everything older.
-		runCutoff := dataStartTime.Add(-10 * time.Minute)
+		// Keep events in the window: [dataStartTime - 10min, dataEndTime + 10min].
+		// This discards entries from previous runs (too old) AND later-in-the-day
+		// runs (too new) that share the same append-only file.
+		lowerCutoff := dataStartTime.Add(-10 * time.Minute)
+		upperCutoff := dataEndTime.Add(10 * time.Minute)
 		for sc.Scan() {
 			line := sc.Text()
 			if line == "" {
@@ -115,14 +117,15 @@ func main() {
 			}
 			if !dataStartTime.IsZero() {
 				t, err := parseIST(ev.Timestamp, istLoc)
-				if err != nil || t.Before(runCutoff) {
-					continue // belongs to a previous run
+				if err != nil || t.Before(lowerCutoff) || t.After(upperCutoff) {
+					continue // belongs to a different run
 				}
 			}
 			pipelineEvents = append(pipelineEvents, ev)
 		}
 		eventsFile.Close()
 	}
+
 
 	// Build ordered ATM phases from INIT + ACTIVE_SWITCH events only.
 	// These mark when the pipeline committed to a new active set of symbols.
@@ -333,6 +336,11 @@ func main() {
 		if len(phases) > 0 {
 			fmt.Println("\n--- ATM Phase Timeline ---")
 			for i, ph := range phases {
+				phaseTickCount := len(phaseTicks[i])
+				if phaseTickCount == 0 {
+					continue // skip phases that captured no ticks
+				}
+
 				var duration string
 				if !ph.EndTime.IsZero() {
 					d := ph.EndTime.Sub(ph.StartTime)
@@ -352,9 +360,8 @@ func main() {
 					extendNote = fmt.Sprintf("  [%d extensions — volatile entry]", extendCount)
 				}
 
-				phaseTickCount := len(phaseTicks[i])
 				tpsNote := ""
-				if phaseTickCount > 0 && !ph.StartTime.IsZero() {
+				if !ph.StartTime.IsZero() {
 					endT := ph.EndTime
 					if endT.IsZero() {
 						endT = dataEndTime
