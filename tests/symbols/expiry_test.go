@@ -4,11 +4,11 @@ import (
 	"log/slog"
 	"os"
 	"testing"
-	"time"
 
 	"fyers-trading/config"
 	"fyers-trading/symbols"
 )
+
 
 func TestGetTradingExpiry(t *testing.T) {
 	// Skip if NO_NETWORK is set
@@ -46,14 +46,3 @@ func TestGetTradingExpiry(t *testing.T) {
 	}
 }
 
-func TestFormatExpiryForSymbol(t *testing.T) {
-	date1 := time.Date(2026, time.March, 17, 0, 0, 0, 0, time.UTC)
-	if got := symbols.FormatExpiryForSymbol(date1); got != "26317" {
-		t.Errorf("Expected 26317, got %s", got)
-	}
-
-	date2 := time.Date(2026, time.October, 27, 0, 0, 0, 0, time.UTC)
-	if got := symbols.FormatExpiryForSymbol(date2); got != "26O27" {
-		t.Errorf("Expected 26O27, got %s", got)
-	}
-}

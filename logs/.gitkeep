@@ -1,0 +1,2 @@
+# This file ensures the logs/ directory is tracked by git (the directory
+# itself is needed for the Docker volume mount) but its contents are ignored.
