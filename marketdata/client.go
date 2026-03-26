@@ -123,16 +123,16 @@ func (c *FyersWSClient) Unsubscribe(symbols []string) {
 		return
 	}
 	
-	unsubData := map[string]interface{}{
-		"subs":    -1, // -1 for unsubscribe
-		"symbols": symbols,
-		"mode":    "depth",
-		"channel": "1",
+	symbolMap := make(map[string]bool)
+	for _, sym := range symbols {
+		symbolMap[sym] = true
 	}
 
 	unsubMsg := map[string]interface{}{
-		"type": 1, // 1 = Subscription message type
-		"data": unsubData,
+		"type":    "unsubscribe",
+		"symbols": symbolMap,
+		"channel": "1",
+		"mode":    "depth",
 	}
 
 	if err := c.conn.WriteJSON(unsubMsg); err != nil {
@@ -147,33 +147,34 @@ func (c *FyersWSClient) sendSubscription(symbols []string) {
 		return
 	}
 
-	// Fyers v3 Tbtws docsv3 Subscription JSON format
-	subData := map[string]interface{}{
-		"subs":    1,       // 1 for subscribe
-		"symbols": symbols,
-		"mode":    "depth", // Unthrottled 50-level market depth
-		"channel": "1",     // assigning all sub to channel 1 for now
+	symbolMap := make(map[string]bool)
+	for _, sym := range symbols {
+		symbolMap[sym] = true
 	}
 
+	// Fyers v3 Tbtws JSON payload format
 	subMsg := map[string]interface{}{
-		"type": 1, 
-		"data": subData,
+		"type":    "subscribe",
+		"symbols": symbolMap,
+		"mode":    "depth", // Unthrottled 50-level market depth
+		"channel": "1",     // assigning all sub to channel 1 for now
 	}
 
 	err := c.conn.WriteJSON(subMsg)
 	if err != nil {
 		c.logger.Error("Failed to send subscription", "err", err)
 		return
+	} // Important: We must also send a Switch Channel message to "resume" channel 1
+	
+	resumeMap := map[string]bool{"1": true}
+	pauseMap := map[string]bool{}
+
+	resumeMsg := map[string]interface{}{
+		"type":            "switch_channel",
+		"resume_channels": resumeMap,
+		"pause_channels":  pauseMap,
 	}
 
-	// Important: We must also send a Switch Channel message to "resume" channel 1
-	resumeMsg := map[string]interface{}{
-		"type": 2, // 2 = switch channel
-		"data": map[string]interface{}{
-			"resumeChannels": []string{"1"},
-			"pauseChannels":  []string{},
-		},
-	}
 	err = c.conn.WriteJSON(resumeMsg)
 	if err != nil {
 		c.logger.Error("Failed to send channel resume", "err", err)
