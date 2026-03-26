@@ -79,10 +79,34 @@ func (c *FyersWSClient) Connect() error {
 	return nil
 }
 
+// isSameSymbols checks if two string slices contain the exact same elements (order-independent)
+func isSameSymbols(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int)
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Subscribe requests SymbolUpdate (Tick-by-Tick) for the given NSE symbols.
 func (c *FyersWSClient) Subscribe(symbols []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Dedup check: if we are already subscribed to these exact symbols, skip
+	if isSameSymbols(c.symbols, symbols) {
+		c.logger.Info("ATM maintained, already subscribed to symbols", "symbols", symbols)
+		return
+	}
 
 	c.symbols = symbols
 	if c.conn != nil {
