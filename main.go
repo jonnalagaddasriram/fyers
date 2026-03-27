@@ -75,15 +75,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if err := tradingCfg.Reload("trading.json"); err != nil {
-				logger.Warn("Failed to hot-reload trading.json", "error", err)
-			}
-		}
-	}()
+	// (Hot-Reloader daemon has been safely migrated beneath the RingBuffer instantiations)
 
 	// 1.6 Initialize IMF Manager (Master File)
 	imfManager := symbols.NewIMFManager(logger, "data")
@@ -121,6 +113,26 @@ func main() {
 	testOptionReader := optionsRingBuffer.NewReader()
 	testIndexReader := indexRingBuffer.NewReader()
 	pipelineReader := indexRingBuffer.NewReader() // Pipeline strictly reads Index to calculate ATM strikes
+
+	// 2.5 Apply configured zero-lock CPU throttles and start Hot-Reloader Daemon
+	initSleep := int64(tradingCfg.GetReaderSleepMicroseconds())
+	optionsRingBuffer.SetSleepBackoff(initSleep)
+	indexRingBuffer.SetSleepBackoff(initSleep)
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := tradingCfg.Reload("trading.json"); err != nil {
+				logger.Warn("Failed to hot-reload trading.json", "error", err)
+			} else {
+				// Push the zero-lock hot-reloaded backoff directly down into the RingBuffers natively
+				backoff := int64(tradingCfg.GetReaderSleepMicroseconds())
+				optionsRingBuffer.SetSleepBackoff(backoff)
+				indexRingBuffer.SetSleepBackoff(backoff)
+			}
+		}
+	}()
 
 	var ticksLogMu sync.Mutex
 	ticksLog := make([]marketdata.TickEvent, 0, 500000)

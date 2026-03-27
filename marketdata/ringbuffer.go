@@ -3,6 +3,7 @@ package marketdata
 import (
 	"runtime"
 	"sync/atomic"
+	"time"
 )
 
 // RingBuffer is a lock-free Single-Producer, Multiple-Consumer (SPMC) ring buffer.
@@ -13,10 +14,18 @@ type RingBuffer struct {
 	mask     uint64
 	closed   uint32
 
+	// Concurrency Tuning
+	sleepMicrosecs int64 // Instructs starving readers to yield OS CPU entirely
+
 	// CPU Cache Line padding (64 bytes) to prevent False Sharing 
 	// between the producer's writePos and the consumer's readPos.
-	_        [7]uint64
+	_        [6]uint64
 	writePos uint64 // Modified ONLY by the single Producer
+}
+
+// SetSleepBackoff actively overwrites the reader throttling lock-free on the fly
+func (rb *RingBuffer) SetSleepBackoff(microsecs int64) {
+	atomic.StoreInt64(&rb.sleepMicrosecs, microsecs)
 }
 
 // NewRingBuffer creates a new lock-free ring buffer
@@ -74,6 +83,7 @@ func (rb *RingBuffer) NewReader() *Reader {
 // If reader is caught up with writer, it spin-waits using Gosched.
 // If reader is too far behind (writer lapped the reader), it skips to latest.
 func (r *Reader) Next() *TickEvent {
+	spins := 0
 	for {
 		writePos := atomic.LoadUint64(&r.rb.writePos)
 
@@ -81,10 +91,25 @@ func (r *Reader) Next() *TickEvent {
 			if atomic.LoadUint32(&r.rb.closed) == 1 {
 				return nil // Buffer empty and closed, signal reader to exit
 			}
-			// Buffered caught up, spin wait
-			runtime.Gosched()
+			
+			// Exponential Backoff Spin-Wait Logic (Stops 100% CPU pinning loop)
+			if spins < 100 {
+				// Step 1: Rapid hot-path yielding. Instantly catches microsecond bursts
+				runtime.Gosched()
+			} else {
+				// Step 2: Genuine idleness detected. Request explicit OS CPU thread removal
+				sleepTime := atomic.LoadInt64(&r.rb.sleepMicrosecs)
+				if sleepTime > 0 {
+					time.Sleep(time.Duration(sleepTime) * time.Microsecond)
+				} else {
+					runtime.Gosched() // Users intentionally configuring 0ms demand HFT 100% CPU locking
+				}
+			}
+			spins++
 			continue
 		}
+		
+		spins = 0 // Instant reset on data hit
 
 		if writePos-r.readPos > r.rb.capacity {
 			// Writer lapped the reader. Skip to latest to avoid stale data.

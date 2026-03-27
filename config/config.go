@@ -44,6 +44,7 @@ type TradingConfig struct {
 	MaxDailyLoss               int    `json:"max_daily_loss"`
 	TradingStartTime           string `json:"trading_start_time"`
 	TradingEndTime             string `json:"trading_end_time"`
+	ReaderSleepMicroseconds    int    `json:"reader_sleep_microseconds"`
 }
 
 func LoadAppConfig() (*AppConfig, error) {
@@ -132,6 +133,7 @@ func (tc *TradingConfig) Reload(filePath string) error {
 	tc.MaxDailyLoss = newCfg.MaxDailyLoss
 	tc.TradingStartTime = newCfg.TradingStartTime
 	tc.TradingEndTime = newCfg.TradingEndTime
+	tc.ReaderSleepMicroseconds = newCfg.ReaderSleepMicroseconds
 	tc.mu.Unlock()
 
 	return nil
@@ -236,4 +238,10 @@ func getEnvOrDefault(key, def string) string {
 		return val
 	}
 	return def
+}
+
+func (tc *TradingConfig) GetReaderSleepMicroseconds() int {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return tc.ReaderSleepMicroseconds
 }

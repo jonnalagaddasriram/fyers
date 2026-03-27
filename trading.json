@@ -13,5 +13,6 @@
     "max_position_value": 500000,
     "max_daily_loss": 10000,
     "trading_start_time": "09:20",
-    "trading_end_time": "15:15"
+    "trading_end_time": "15:15",
+    "reader_sleep_microseconds": 500
 }

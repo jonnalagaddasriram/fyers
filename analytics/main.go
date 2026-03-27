@@ -65,10 +65,15 @@ func main() {
 	var localStartTime time.Time
 	var localEndTime time.Time
 
+	type Gap struct {
+		Duration time.Duration
+		Time     time.Time
+	}
+
 	// Batch analytics tracking per symbol
 	type BatchStats struct {
 		BatchSizes       []int
-		TimeGaps         []time.Duration
+		TimeGaps         []Gap // Explicitly pairs the gap latency with the exact wall-clock occurrence
 		CurrentBatchSize int
 		LastBatchTime    time.Time
 	}
@@ -156,7 +161,7 @@ func main() {
 					bStats.CurrentBatchSize++
 				} else {
 					bStats.BatchSizes = append(bStats.BatchSizes, bStats.CurrentBatchSize)
-					bStats.TimeGaps = append(bStats.TimeGaps, gap)
+					bStats.TimeGaps = append(bStats.TimeGaps, Gap{Duration: gap, Time: recvTime})
 					bStats.CurrentBatchSize = 1
 					bStats.LastBatchTime = recvTime
 				}
@@ -262,13 +267,15 @@ func main() {
 			var totalGap time.Duration
 			var minGap time.Duration = time.Hour
 			var maxGap time.Duration = -1
+			var maxGapTime time.Time
 			for _, g := range bStats.TimeGaps {
-				totalGap += g
-				if g < minGap {
-					minGap = g
+				totalGap += g.Duration
+				if g.Duration < minGap {
+					minGap = g.Duration
 				}
-				if g > maxGap {
-					maxGap = g
+				if g.Duration > maxGap {
+					maxGap = g.Duration
+					maxGapTime = g.Time
 				}
 			}
 			
@@ -282,7 +289,11 @@ func main() {
 
 			fmt.Printf("    => Batches: %d | Avg per batch: %.2f ticks\n", len(bStats.BatchSizes), avgBatch)
 			if len(bStats.TimeGaps) > 0 {
-				fmt.Printf("    => Wait Gaps: Avg=%v | Min=%v | Max=%v\n", avgGap.Round(time.Millisecond), minGap.Round(time.Millisecond), maxGap.Round(time.Millisecond))
+				fmt.Printf("    => Wait Gaps: Avg=%v | Min=%v | Max=%v (at %s IST)\n", 
+					avgGap.Round(time.Millisecond), 
+					minGap.Round(time.Millisecond), 
+					maxGap.Round(time.Millisecond), 
+					maxGapTime.In(istLoc).Format("15:04:05"))
 			}
 		}
 	}
