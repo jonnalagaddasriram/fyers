@@ -25,6 +25,11 @@ type TickEvent struct {
 	ExchTimestamp int64 // timestamp from exchange (seconds); absent in DepthUpdate
 	RecvTimestamp int64 // time.Now().UnixNano() at receive
 
+	BidPrice float64
+	AskPrice float64
+	BidSize  int64
+	AskSize  int64
+
 	// 5-level market depth (DepthUpdate only)
 	Bid [5]DepthLevel
 	Ask [5]DepthLevel

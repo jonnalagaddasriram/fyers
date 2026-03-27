@@ -100,7 +100,7 @@ func main() {
 	}
 
 	// 2. Initialize Market Data Infrastructure
-	ringBuffer := marketdata.NewRingBuffer(appCfg.RingBufferSize)
+	ringBuffer := marketdata.NewRingBuffer(8192)
 
 	// Track latest prices
 	tickStore := marketdata.NewTickStore(logger)
@@ -156,10 +156,7 @@ func main() {
 				return
 			}
 
-			// Skip index ticks — only store CE/PE option data for analytics
-			if tick.Symbol == "NSE:NIFTY50-INDEX" {
-				continue
-			}
+			// We intentionally record the Index here too so the analytics tool can calculate relative throughput.
 
 			// Store a struct copy so we don't accidentally maintain pointers to pooled objects
 			optionTicksLog = append(optionTicksLog, *tick)

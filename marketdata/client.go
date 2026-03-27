@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	fyersgosdk "github.com/FyersDev/fyers-go-sdk"
@@ -16,6 +17,9 @@ type FyersWSClient struct {
 	logger          *slog.Logger
 	symbols         []string // CE/PE option symbols (DepthUpdate)
 	indexSymbols    []string // Index symbols (SymbolUpdate)
+	subscribed      map[string]bool
+	orderbooks      map[string]*TickEvent
+	mu              sync.Mutex
 	OnInvalidSymbol func(invalidSymbols []string) // Callback for pipeline fallback
 }
 
@@ -25,6 +29,8 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 		logger:       logger,
 		symbols:      make([]string, 0),
 		indexSymbols: make([]string, 0),
+		subscribed:   make(map[string]bool),
+		orderbooks:   make(map[string]*TickEvent),
 	}
 
 	onConnect := func() {
@@ -65,76 +71,94 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 	onMessage := func(message fyersws.DataResponse) {
 		recvTime := time.Now().UnixNano()
 
-		// Get an empty tick from pool
-		tick := GetTickEvent()
-		tick.RecvTimestamp = recvTime
-
-		// Both DepthUpdate and SymbolUpdate carry a "symbol" key
-		if sym, ok := message["symbol"].(string); ok {
-			tick.Symbol = sym
+		var sym string
+		if s, ok := message["symbol"].(string); ok {
+			sym = s
 		} else {
-			PutTickEvent(tick)
-			return // Ignore malformed messages
+			return // Ignore malformed messages entirely
 		}
+
+		client.mu.Lock()
+		state, exists := client.orderbooks[sym]
+		if !exists {
+			state = GetTickEvent()
+			state.Symbol = sym
+			client.orderbooks[sym] = state
+		}
+
+		state.RecvTimestamp = recvTime
 
 		// Common OHLC / LTP fields (present in SymbolUpdate; may be absent in DepthUpdate)
 		if ltpVal, ok := message["ltp"]; ok {
-			tick.LTP = convertToFloat64(ltpVal)
+			state.LTP = convertToFloat64(ltpVal)
 		}
 		if volVal, ok := message["vol_traded_today"]; ok {
-			tick.Volume = convertToInt64(volVal)
+			state.Volume = convertToInt64(volVal)
 		}
-		if volVal, ok := message["volume"]; ok && tick.Volume == 0 {
-			tick.Volume = convertToInt64(volVal)
+		if volVal, ok := message["volume"]; ok && state.Volume == 0 {
+			state.Volume = convertToInt64(volVal)
 		}
 		if exchTimeVal, ok := message["exch_feed_time"]; ok {
-			tick.ExchTimestamp = convertToInt64(exchTimeVal)
+			state.ExchTimestamp = convertToInt64(exchTimeVal)
 		}
 		if openVal, ok := message["open_price"]; ok {
-			tick.Open = convertToFloat64(openVal)
+			state.Open = convertToFloat64(openVal)
 		}
 		if highVal, ok := message["high_price"]; ok {
-			tick.High = convertToFloat64(highVal)
+			state.High = convertToFloat64(highVal)
 		}
 		if lowVal, ok := message["low_price"]; ok {
-			tick.Low = convertToFloat64(lowVal)
+			state.Low = convertToFloat64(lowVal)
 		}
 		if closeVal, ok := message["prev_close_price"]; ok {
-			tick.Close = convertToFloat64(closeVal)
+			state.Close = convertToFloat64(closeVal)
 		}
 		if chVal, ok := message["ch"]; ok {
-			tick.Change = convertToFloat64(chVal)
+			state.Change = convertToFloat64(chVal)
 		}
 		if chpVal, ok := message["chp"]; ok {
-			tick.ChangePercent = convertToFloat64(chpVal)
+			state.ChangePercent = convertToFloat64(chpVal)
 		}
 
 		// 5-level market depth — only present in DepthUpdate ticks (type="dp").
 		// Keys are 1-indexed: bid_price1…bid_price5, ask_price1…ask_price5, etc.
-		for i := 0; i < 5; i++ {
-			n := i + 1
-			if v, ok := message[fmt.Sprintf("bid_price%d", n)]; ok {
-				tick.Bid[i].Price = convertToFloat64(v)
-			}
-			if v, ok := message[fmt.Sprintf("bid_size%d", n)]; ok {
-				tick.Bid[i].Size = convertToInt64(v)
-			}
-			if v, ok := message[fmt.Sprintf("bid_order%d", n)]; ok {
-				tick.Bid[i].Orders = convertToInt64(v)
-			}
-			if v, ok := message[fmt.Sprintf("ask_price%d", n)]; ok {
-				tick.Ask[i].Price = convertToFloat64(v)
-			}
-			if v, ok := message[fmt.Sprintf("ask_size%d", n)]; ok {
-				tick.Ask[i].Size = convertToInt64(v)
-			}
-			if v, ok := message[fmt.Sprintf("ask_order%d", n)]; ok {
-				tick.Ask[i].Orders = convertToInt64(v)
+		if message["type"] == "dp" {
+			for i := 0; i < 5; i++ {
+				n := i + 1
+				if v, ok := message[fmt.Sprintf("bid_price%d", n)]; ok {
+					state.Bid[i].Price = convertToFloat64(v)
+				}
+				if v, ok := message[fmt.Sprintf("bid_size%d", n)]; ok {
+					state.Bid[i].Size = convertToInt64(v)
+				}
+				if v, ok := message[fmt.Sprintf("bid_order%d", n)]; ok {
+					state.Bid[i].Orders = convertToInt64(v)
+				}
+				if v, ok := message[fmt.Sprintf("ask_price%d", n)]; ok {
+					state.Ask[i].Price = convertToFloat64(v)
+				}
+				if v, ok := message[fmt.Sprintf("ask_size%d", n)]; ok {
+					state.Ask[i].Size = convertToInt64(v)
+				}
+				if v, ok := message[fmt.Sprintf("ask_order%d", n)]; ok {
+					state.Ask[i].Orders = convertToInt64(v)
+				}
 			}
 		}
 
-		// Write to ring buffer
-		client.ringBuffer.Write(tick)
+		// Secure strategy API compatibility safely overriding the root Level 0 elements
+		state.AskPrice = state.Ask[0].Price
+		state.AskSize = state.Ask[0].Size
+		state.BidPrice = state.Bid[0].Price
+		state.BidSize = state.Bid[0].Size
+
+		// Create a strictly deep-copied wrapper clone out of the mutex mapping
+		tickClone := GetTickEvent()
+		*tickClone = *state
+		client.mu.Unlock()
+
+		// Write to ring buffer strictly lock-free
+		client.ringBuffer.Write(tickClone)
 	}
 
 	// 50 max retries, auto-reconnect true
@@ -166,35 +190,81 @@ func (c *FyersWSClient) Close() {
 
 // Subscribe subscribes to CE/PE option symbols using DepthUpdate (full order book).
 func (c *FyersWSClient) Subscribe(symbols []string) {
-	c.symbols = append(c.symbols, symbols...)
-	if c.socket != nil {
-		c.socket.Subscribe(symbols, "DepthUpdate")
-		c.logger.Info("Subscribed to CE/PE symbols (DepthUpdate)", "symbols", symbols)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	var newLocals []string
+	for _, sym := range symbols {
+		if !c.subscribed[sym] {
+			c.subscribed[sym] = true
+			newLocals = append(newLocals, sym)
+		}
+	}
+	
+	c.symbols = symbols
+	
+	if len(newLocals) > 0 && c.socket != nil {
+		c.socket.Subscribe(newLocals, "DepthUpdate")
+		c.logger.Info("Subscribed to CE/PE symbols (DepthUpdate)", "symbols", newLocals)
 	}
 }
 
 // Unsubscribe removes CE/PE option symbols from the DepthUpdate feed.
 func (c *FyersWSClient) Unsubscribe(symbols []string) {
-	if c.socket != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	for _, sym := range symbols {
+		delete(c.subscribed, sym)
+		if oldState, ok := c.orderbooks[sym]; ok {
+			PutTickEvent(oldState)
+			delete(c.orderbooks, sym) // Purge Memory Leak natively
+		}
+	}
+	
+	if len(symbols) > 0 && c.socket != nil {
 		c.socket.Unsubscribe(symbols, "DepthUpdate")
-		c.logger.Info("Unsubscribed from CE/PE symbols (DepthUpdate)", "symbols", symbols)
+		// c.logger.Info("Unsubscribed from CE/PE symbols (DepthUpdate)", "symbols", symbols)
 	}
 }
 
 // SubscribeIndex subscribes to index symbols using SymbolUpdate (LTP-only, lighter feed).
 func (c *FyersWSClient) SubscribeIndex(symbols []string) {
-	c.indexSymbols = append(c.indexSymbols, symbols...)
-	if c.socket != nil {
-		c.socket.Subscribe(symbols, "SymbolUpdate")
-		c.logger.Info("Subscribed to index symbols (SymbolUpdate)", "symbols", symbols)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var newLocals []string
+	for _, sym := range symbols {
+		if !c.subscribed[sym] {
+			c.subscribed[sym] = true
+			newLocals = append(newLocals, sym)
+		}
+	}
+	
+	c.indexSymbols = symbols
+	
+	if len(newLocals) > 0 && c.socket != nil {
+		c.socket.Subscribe(newLocals, "SymbolUpdate")
+		// c.logger.Info("Subscribed to index symbols (SymbolUpdate)", "symbols", newLocals)
 	}
 }
 
 // UnsubscribeIndex removes index symbols from the SymbolUpdate feed.
 func (c *FyersWSClient) UnsubscribeIndex(symbols []string) {
-	if c.socket != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	for _, sym := range symbols {
+		delete(c.subscribed, sym)
+		if oldState, ok := c.orderbooks[sym]; ok {
+			PutTickEvent(oldState)
+			delete(c.orderbooks, sym)
+		}
+	}
+	
+	if len(symbols) > 0 && c.socket != nil {
 		c.socket.Unsubscribe(symbols, "SymbolUpdate")
-		c.logger.Info("Unsubscribed from index symbols (SymbolUpdate)", "symbols", symbols)
+		// c.logger.Info("Unsubscribed from index symbols (SymbolUpdate)", "symbols", symbols)
 	}
 }
 

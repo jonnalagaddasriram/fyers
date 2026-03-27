@@ -187,7 +187,26 @@ func (p *Pipeline) ProcessNiftyTick(ltp float64) {
 		// A countdown is currently active
 		latestPending := p.pendingShifts[len(p.pendingShifts)-1].ATM
 		if newATM == latestPending {
-			return // We are already pending this exact new ATM, nothing to do.
+			return // We are already exactly tracking this pending ATM
+		}
+
+		if newATM == p.activeATM {
+			// Market oscillated back exactly to our current active baseline! 
+			// We can completely abort the shift cycle and restore absolute stability.
+			p.logger.Info("Market strictly recovered to original ATM! Aborting shift timers silently.", "stable_atm", p.activeATM)
+			p.pendingShifts = make([]PendingShift, 0)
+			if p.shiftTimer != nil {
+				p.shiftTimer.Stop()
+				p.shiftTimer = nil
+			}
+			return
+		}
+
+		// Prevent infinite buffering of rapidly bouncing ATM strikes (e.g. 23000 -> 22950 -> 23000 -> 22950)
+		for _, pending := range p.pendingShifts {
+			if pending.ATM == newATM {
+				return // We already subscribed to this during the active countdown window to buffer it. Ignore.
+			}
 		}
 
 		p.logger.Info("Market moved again during pending countdown! Buffering new strikes.", "old_pending", latestPending, "new_pending", newATM)
