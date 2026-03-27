@@ -21,11 +21,13 @@ type FyersWSClient struct {
 	ringBuffer  *RingBuffer
 	logger      *slog.Logger
 
-	conn     *websocket.Conn
-	symbols  []string
-	tokenMap map[string]string // Maps fytoken back to human-readable symbol
-	mu       sync.Mutex        // Protects sub/unsub sending and tokenMap
-	done     chan struct{}
+	conn       *websocket.Conn
+	symbols    []string
+	tokenMap   map[string]string // Maps fytoken back to human-readable symbol
+	subscribed map[string]bool   // Deduplication tracker
+	orderbooks map[string]*TickEvent
+	mu         sync.Mutex        // Protects sub/unsub sending and state caches
+	done       chan struct{}
 	
 	// OnInvalidSymbol is a callback hook triggered if the broker rejects specific symbols.
 	OnInvalidSymbol func(invalidSymbols []string)
@@ -38,6 +40,8 @@ func NewFyersWSClient(accessToken string, rb *RingBuffer, logger *slog.Logger) *
 		logger:      logger,
 		symbols:     make([]string, 0),
 		tokenMap:    make(map[string]string),
+		subscribed:  make(map[string]bool),
+		orderbooks:  make(map[string]*TickEvent),
 		done:        make(chan struct{}),
 	}
 }
@@ -102,15 +106,24 @@ func (c *FyersWSClient) Subscribe(symbols []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Dedup check: if we are already subscribed to these exact symbols, skip
-	if isSameSymbols(c.symbols, symbols) {
-		c.logger.Info("ATM maintained, already subscribed to symbols", "symbols", symbols)
+	var newLocals []string
+	for _, sym := range symbols {
+		if !c.subscribed[sym] {
+			c.subscribed[sym] = true
+			newLocals = append(newLocals, sym)
+		}
+	}
+
+	// Store full active list so Connect() can seamlessly recreate the feed if the socket drops
+	c.symbols = symbols
+
+	if len(newLocals) == 0 {
+		c.logger.Debug("Ignoring duplicate TBT subscription request", "symbols", symbols)
 		return
 	}
 
-	c.symbols = symbols
 	if c.conn != nil {
-		c.sendSubscription(symbols)
+		c.sendSubscription(newLocals)
 	}
 }
 
@@ -122,23 +135,40 @@ func (c *FyersWSClient) Unsubscribe(symbols []string) {
 	if c.conn == nil || len(symbols) == 0 {
 		return
 	}
-	
-	symbolMap := make(map[string]bool)
-	for _, sym := range symbols {
-		symbolMap[sym] = true
-	}
 
+	// Purge from deduplication cache so rapid re-subs aren't infinitely blocked
+	for _, sym := range symbols {
+		delete(c.subscribed, sym)
+	}
+	
 	unsubMsg := map[string]interface{}{
-		"type":    "unsubscribe",
-		"symbols": symbolMap,
-		"channel": "1",
-		"mode":    "depth",
+		"type": 1,
+		"data": map[string]interface{}{
+			"subs":    -1,
+			"symbols": symbols,
+			"mode":    "depth",
+			"channel": "1",
+		},
 	}
 
 	if err := c.conn.WriteJSON(unsubMsg); err != nil {
 		c.logger.Error("Failed to send unsubscription", "err", err)
 	} else {
 		c.logger.Info("Unsubscribed from old symbols via TBT", "count", len(symbols))
+		
+		// Senior-Audit: Eliminate memory leak natively!
+		for _, sym := range symbols {
+			if oldState, ok := c.orderbooks[sym]; ok {
+				PutTickEvent(oldState) // Safely recycle the old pointer to the Pool
+				delete(c.orderbooks, sym) // Purge the Map
+			}
+			// Reverse map search to un-alias fytoken to prevent tokenMap bloating
+			for fyToken, targetSym := range c.tokenMap {
+				if targetSym == sym {
+					delete(c.tokenMap, fyToken)
+				}
+			}
+		}
 	}
 }
 
@@ -147,32 +177,30 @@ func (c *FyersWSClient) sendSubscription(symbols []string) {
 		return
 	}
 
-	symbolMap := make(map[string]bool)
-	for _, sym := range symbols {
-		symbolMap[sym] = true
-	}
-
-	// Fyers v3 Tbtws JSON payload format
+	// Fyers v3 Tbtws JSON payload format: type: 1
 	subMsg := map[string]interface{}{
-		"type":    "subscribe",
-		"symbols": symbolMap,
-		"mode":    "depth", // Unthrottled 50-level market depth
-		"channel": "1",     // assigning all sub to channel 1 for now
+		"type": 1,
+		"data": map[string]interface{}{
+			"subs":    1,
+			"symbols": symbols,
+			"mode":    "depth",
+			"channel": "1",
+		},
 	}
 
 	err := c.conn.WriteJSON(subMsg)
 	if err != nil {
 		c.logger.Error("Failed to send subscription", "err", err)
 		return
-	} // Important: We must also send a Switch Channel message to "resume" channel 1
+	}
 	
-	resumeMap := map[string]bool{"1": true}
-	pauseMap := map[string]bool{}
-
+	// Important: We must also send a Switch Channel message to "resume" channel 1
 	resumeMsg := map[string]interface{}{
-		"type":            "switch_channel",
-		"resume_channels": resumeMap,
-		"pause_channels":  pauseMap,
+		"type": 2,
+		"data": map[string]interface{}{
+			"resumeChannels": []string{"1"},
+			"pauseChannels":  []string{},
+		},
 	}
 
 	err = c.conn.WriteJSON(resumeMsg)
@@ -196,7 +224,6 @@ func (c *FyersWSClient) pingPump() {
 			c.mu.Lock()
 			if c.conn != nil {
 				// The documentation specifically says "Data Format: "ping""
-				// So we send a literal text frame containing "ping"
 				err := c.conn.WriteMessage(websocket.TextMessage, []byte("ping"))
 				if err != nil {
 					c.logger.Warn("Failed to send Tbtws Keep-Alive ping", "error", err)
@@ -219,11 +246,11 @@ func (c *FyersWSClient) readPump() {
 	}()
 
 	c.conn.SetReadLimit(81920) // Allow large packets if Fyers decides to batch during spikes
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
+	
+	// Fyers Tbtws uses application-level text "ping"s instead of standard RFC-6455 Ping/Pong frames.
+	// Therefore, setting a strict Gorilla ReadDeadline causes arbitrary 60-second `i/o timeout` disconnects 
+	// because the underlying handler never intercepts a protocol-level Pong to refresh the deadline clock.
+	// We rely on our `pingPump` and OS TCP KeepAlives to detect genuine dead connections natively.
 
 	for {
 		select {
@@ -237,7 +264,14 @@ func (c *FyersWSClient) readPump() {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				c.logger.Error("Tbtws Disconnected unexpectedly", "err", err.Error())
 			}
-			c.logger.Warn("Tbtws connection lost.", "err", err.Error())
+			
+			// Deep inspection of the Close frame!
+			if closeErr, ok := err.(*websocket.CloseError); ok {
+				c.logger.Error("Tbtws explicitly closed connection!", "code", closeErr.Code, "reason_text", closeErr.Text)
+			} else {
+				c.logger.Warn("Tbtws connection lost (not a structured CloseError).", "err", err.Error())
+			}
+
 			// Simple auto-reconnect logic
 			time.Sleep(2 * time.Second)
 			_ = c.Connect()
@@ -285,56 +319,87 @@ func (c *FyersWSClient) processMessage(msg []byte) {
 }
 
 func (c *FyersWSClient) parseAndDispatch(fytoken string, feed *fyersproto.MarketFeed, recvTime int64) {
-	tick := GetTickEvent()
-	tick.RecvTimestamp = recvTime
-
-	// Map numeric fytoken back to normal string symbol
 	c.mu.Lock()
 	if feed.Ticker != "" {
 		c.tokenMap[fytoken] = feed.Ticker
 	}
 	sym, ok := c.tokenMap[fytoken]
-	c.mu.Unlock()
-
-	if ok && sym != "" {
-		tick.Symbol = sym
-	} else {
-		tick.Symbol = fytoken // fallback to raw
+	if !ok || sym == "" {
+		sym = fytoken
 	}
 
+	state, exists := c.orderbooks[sym]
+	if !exists {
+		state = GetTickEvent()
+		state.Symbol = sym
+		c.orderbooks[sym] = state
+	} else if feed.Snapshot {
+		// Senior-Audit: Overwriting pointers destroys sync.Pool's zero-allocation bounds! 
+		// Instead of dropping it to GC, natively zero-initialize exactly what Fyers resets.
+		state.Bids = [50]DepthLevel{}
+		state.Asks = [50]DepthLevel{}
+	}
+
+	state.RecvTimestamp = recvTime
+
 	if feed.FeedTime != nil {
-		tick.ExchTimestamp = int64(feed.FeedTime.Value)
+		state.ExchTimestamp = int64(feed.FeedTime.Value)
 	}
 
 	if feed.Quote != nil {
 		if feed.Quote.Ltp != nil {
-			tick.LTP = float64(feed.Quote.Ltp.Value) / 100.0 // Usually, prices in Fyers protobuf are * 100
+			state.LTP = float64(feed.Quote.Ltp.Value) / 100.0
 		}
 		if feed.Quote.Vtt != nil {
-			tick.Volume = int64(feed.Quote.Vtt.Value)
+			state.Volume = int64(feed.Quote.Vtt.Value)
 		}
 	}
 	
 	if feed.Depth != nil {
 		for _, ask := range feed.Depth.Asks {
-			if ask != nil && ask.Num != nil && ask.Num.Value == 0 {
+			if ask != nil && ask.Num != nil && ask.Num.Value < 50 {
+				idx := ask.Num.Value
 				if ask.Price != nil {
-					tick.AskPrice = float64(ask.Price.Value) / 100.0
+					state.Asks[idx].Price = float64(ask.Price.Value) / 100.0
+				}
+				if ask.Qty != nil {
+					state.Asks[idx].Qty = int64(ask.Qty.Value)
+				}
+				if ask.Nord != nil {
+					state.Asks[idx].Orders = int64(ask.Nord.Value)
 				}
 			}
 		}
 		for _, bid := range feed.Depth.Bids {
-			if bid != nil && bid.Num != nil && bid.Num.Value == 0 {
+			if bid != nil && bid.Num != nil && bid.Num.Value < 50 {
+				idx := bid.Num.Value
 				if bid.Price != nil {
-					tick.BidPrice = float64(bid.Price.Value) / 100.0
+					state.Bids[idx].Price = float64(bid.Price.Value) / 100.0
+				}
+				if bid.Qty != nil {
+					state.Bids[idx].Qty = int64(bid.Qty.Value)
+				}
+				if bid.Nord != nil {
+					state.Bids[idx].Orders = int64(bid.Nord.Value)
 				}
 			}
 		}
 	}
 
-	// Unconditionally dispatch the tick! If Fyers sent a diff packet (even if it's just 
-	// Level 3 orderbook quantity changing), it counts as a valid network event.
-	c.ringBuffer.Write(tick)
+	// Always sync the top-of-book natively to the root level struct for strategy convenience
+	// Senior-Audit: If Fyers sends a Diff actively destroying L0 liquidity (Level collapsed), 
+	// blindly checking > 0 incorrectly shields the struct and eternally stalls `AskPrice` at a stale quote.
+	state.AskPrice = state.Asks[0].Price
+	state.AskSize = state.Asks[0].Qty
+	state.BidPrice = state.Bids[0].Price
+	state.BidSize = state.Bids[0].Qty
+
+	// Create a copied clone to push into the lock-free ring buffer
+	tickClone := GetTickEvent()
+	*tickClone = *state
+	c.mu.Unlock()
+
+	c.ringBuffer.Write(tickClone)
 }
 
 // Close gracefully shuts down the WebSocket to flush pending updates.

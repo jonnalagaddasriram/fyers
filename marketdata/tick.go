@@ -1,6 +1,11 @@
 package marketdata
 
 import "sync"
+type DepthLevel struct {
+	Price  float64
+	Qty    int64
+	Orders int64
+}
 
 // TickEvent represents a normalized tick from the exchange
 type TickEvent struct {
@@ -15,6 +20,8 @@ type TickEvent struct {
 	AskPrice      float64
 	BidSize       int64
 	AskSize       int64
+	Bids          [50]DepthLevel
+	Asks          [50]DepthLevel
 	Change        float64
 	ChangePercent float64
 	ExchTimestamp int64 // timestamp from exchange (seconds)

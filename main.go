@@ -104,7 +104,7 @@ func main() {
 
 	// 2. Initialize Market Data Infrastructure
 	// We use two completely independent lock-free pure SPMC RingBuffers!
-	optionsRingBuffer := marketdata.NewRingBuffer(appCfg.RingBufferSize)
+	optionsRingBuffer := marketdata.NewRingBuffer(8192)
 	indexRingBuffer := marketdata.NewRingBuffer(1024)
 
 	// Track latest prices
